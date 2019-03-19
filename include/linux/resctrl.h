@@ -9,6 +9,9 @@
 /* CLOSID value used by the default control group */
 #define RESCTRL_RESERVED_CLOSID		0
 
+/* Indicates no CPU needs to be excluded */
+#define RESCTRL_PICK_ANY_CPU		-1
+
 #ifdef CONFIG_PROC_CPU_RESCTRL
 
 int proc_resctrl_show(struct seq_file *m,
