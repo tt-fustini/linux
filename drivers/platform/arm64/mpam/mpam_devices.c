@@ -1440,6 +1440,46 @@ static void mpam_enable_once(void)
 		READ_ONCE(mpam_partid_max) + 1, mpam_pmg_max + 1);
 }
 
+static void mpam_reset_class(struct mpam_class *class)
+{
+	int idx;
+	struct mpam_msc *msc;
+	struct mpam_vmsc *vmsc;
+	struct mpam_msc_ris *ris;
+	struct mpam_component *comp;
+
+	idx = srcu_read_lock(&mpam_srcu);
+	list_for_each_entry_rcu(comp, &class->components, class_list) {
+		list_for_each_entry_rcu(vmsc, &comp->vmsc, comp_list) {
+			msc = vmsc->msc;
+
+			mutex_lock(&msc->lock);
+			list_for_each_entry_rcu(ris, &vmsc->ris, vmsc_list) {
+				mpam_touch_msc(msc, mpam_reset_ris, ris);
+				ris->in_reset_state = true;
+			}
+			mutex_unlock(&msc->lock);
+		}
+	}
+	srcu_read_unlock(&mpam_srcu, idx);
+}
+
+/*
+ * Called in response to an error IRQ.
+ * All of MPAMs errors indicate a software bug, restore any modified
+ * controls to their reset values.
+ */
+void mpam_disable(void)
+{
+	int idx;
+	struct mpam_class *class;
+
+	idx = srcu_read_lock(&mpam_srcu);
+	list_for_each_entry_rcu(class, &mpam_classes, classes_list)
+		mpam_reset_class(class);
+	srcu_read_unlock(&mpam_srcu, idx);
+}
+
 /*
  * Enable mpam once all devices have been probed.
  * Scheduled by mpam_discovery_cpu_online() once all devices have been created.
