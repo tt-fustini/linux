@@ -46,9 +46,20 @@ bool resctrl_arch_mon_capable(void)
 	return exposed_mon_capable;
 }
 
-bool resctrl_arch_get_cdp_enabled(enum resctrl_res_level ignored)
+bool resctrl_arch_get_cdp_enabled(enum resctrl_res_level rid)
 {
-	return cdp_enabled;
+	switch (rid) {
+	case RDT_RESOURCE_L2:
+	case RDT_RESOURCE_L3:
+		return cdp_enabled;
+	case RDT_RESOURCE_MBA:
+	default:
+		/*
+		 * x86's MBA control doesn't support CDP, so user-space doesn't
+		 * expect it.
+		 */
+		return false;
+	}
 }
 
 /**
@@ -93,6 +104,11 @@ int resctrl_arch_set_cdp_enabled(enum resctrl_res_level ignored, bool enable)
 	WRITE_ONCE(arm64_mpam_global_default, regval);
 
 	return 0;
+}
+
+static bool mpam_resctrl_hide_cdp(enum resctrl_res_level rid)
+{
+	return cdp_enabled && !resctrl_arch_get_cdp_enabled(rid);
 }
 
 /*
@@ -231,6 +247,176 @@ static bool cache_has_usable_cpor(struct mpam_class *class)
 	return (class->props.cpbm_wd <= RESCTRL_MAX_CBM);
 }
 
+static bool mba_class_use_mbw_part(struct mpam_props *cprops)
+{
+	/* TODO: Scaling is not yet supported */
+	return (mpam_has_feature(mpam_feat_mbw_part, cprops) &&
+		cprops->mbw_pbm_bits < MAX_MBA_BW);
+}
+
+static bool class_has_usable_mba(struct mpam_props *cprops)
+{
+	if (mba_class_use_mbw_part(cprops) ||
+	    mpam_has_feature(mpam_feat_mbw_max, cprops))
+		return true;
+
+	return false;
+}
+
+/*
+ * Calculate the percentage change from each implemented bit in the control
+ * This can return 0 when BWA_WD is greater than 6. (100 / (1<<7) == 0)
+ */
+static u32 get_mba_granularity(struct mpam_props *cprops)
+{
+	if (mba_class_use_mbw_part(cprops)) {
+		return MAX_MBA_BW / cprops->mbw_pbm_bits;
+	} else if (mpam_has_feature(mpam_feat_mbw_max, cprops)) {
+		/*
+		 * bwa_wd is the number of bits implemented in the 0.xxx
+		 * fixed point fraction. 1 bit is 50%, 2 is 25% etc.
+		 */
+		return MAX_MBA_BW / (cprops->bwa_wd + 1);
+	}
+
+	return 0;
+}
+
+static u32 mbw_pbm_to_percent(unsigned long mbw_pbm, struct mpam_props *cprops)
+{
+	u32 bit, result = 0, granularity = get_mba_granularity(cprops);
+
+	for_each_set_bit(bit, &mbw_pbm, cprops->mbw_pbm_bits % 32) {
+		result += granularity;
+	}
+
+	return result;
+}
+
+static u32 mbw_max_to_percent(u16 mbw_max, struct mpam_props *cprops)
+{
+	u8 bit;
+	u32 divisor = 2, value = 0;
+
+	for (bit = 15; bit; bit--) {
+		if (mbw_max & BIT(bit))
+			value += MAX_MBA_BW / divisor;
+		divisor <<= 1;
+	}
+
+	return value;
+}
+
+static u32 percent_to_mbw_pbm(u8 pc, struct mpam_props *cprops)
+{
+	u32 granularity = get_mba_granularity(cprops);
+	u8 num_bits = pc / granularity;
+
+	if (!num_bits)
+		return 0;
+
+	/* TODO: pick bits at random to avoid contention */
+	return (1 << num_bits) - 1;
+}
+
+static u16 percent_to_mbw_max(u8 pc, struct mpam_props *cprops)
+{
+	u8 bit;
+	u32 divisor = 2, value = 0;
+
+	if (WARN_ON_ONCE(cprops->bwa_wd > 15))
+		return MAX_MBA_BW;
+
+	for (bit = 15; bit; bit--) {
+		if (pc >= MAX_MBA_BW / divisor) {
+			pc -= MAX_MBA_BW / divisor;
+			value |= BIT(bit);
+		}
+		divisor <<= 1;
+
+		if (!pc || !(MAX_MBA_BW / divisor))
+			break;
+	}
+
+	value &= GENMASK(15, 15 - cprops->bwa_wd);
+
+	return value;
+}
+
+/* Find the L3 component that holds this CPU */
+static struct mpam_component *__topology_l3_equivalent(int cpu)
+{
+	struct mpam_component *l3_iter;
+	struct mpam_resctrl_res *res;
+	struct mpam_class *l3;
+
+	res = &mpam_resctrl_controls[RDT_RESOURCE_L3];
+	l3 = res->class;
+	if (!l3)
+		return NULL;
+
+	list_for_each_entry(l3_iter, &l3->components, class_list) {
+		if (cpumask_test_cpu(cpu, &l3_iter->affinity))
+			return l3_iter;
+	}
+
+	return NULL;
+}
+
+static bool __topology_matches_l3(struct mpam_class *victim,
+				  cpumask_var_t tmp_cpumask)
+{
+	struct mpam_component *victim_iter, *l3_iter;
+	int cpu;
+
+	/*
+	 * Walk the two component lists and compare the affinity masks.
+	 * These lists/masks are static, the resctrl domain versions depend on
+	 * which CPUs are online.
+	 */
+	list_for_each_entry(victim_iter, &victim->components, class_list) {
+		cpu = cpumask_any(&victim_iter->affinity);
+		l3_iter = __topology_l3_equivalent(cpu);
+		if (!l3_iter) {
+			pr_debug("__toplogy_matches_l3: Failed to find matching component\n");
+			return false;
+		}
+
+		/* Any differing bits in the affinity mask? */
+		cpumask_xor(tmp_cpumask, &l3_iter->affinity, &victim_iter->affinity);
+		if (!cpumask_empty(tmp_cpumask)) {
+			pr_debug("__toplogy_matches_l3: Mismatched CPU mask\n");
+			return false;
+		}
+	}
+
+	return true;
+}
+
+/*
+ * resctrl expects all the worlds a Xeon, and all counters are on the
+ * L3. We play fast and lose with this, mapping counters on other
+ * classes - provided the CPU->domain mapping is the same kind of shape.
+ * Using cacheinfo directly would make this work even if resctrl can't
+ * use the L3 - but cacheinfo can't tell us anything about offline CPUs.
+ * Use the mpam_class we picked for L3 so we can use its domain list
+ * for this check.
+ */
+static bool topology_matches_l3(struct mpam_class *victim)
+{
+	bool matches;
+	cpumask_var_t tmp_cpumask;
+
+	if (!alloc_cpumask_var(&tmp_cpumask, GFP_KERNEL))
+		return false;
+
+	matches = __topology_matches_l3(victim, tmp_cpumask);
+
+	free_cpumask_var(tmp_cpumask);
+
+	return matches;
+}
+
 /* Test whether we can export MPAM_CLASS_CACHE:{2,3}? */
 static void mpam_resctrl_pick_caches(void)
 {
@@ -270,10 +456,60 @@ static void mpam_resctrl_pick_caches(void)
 	srcu_read_unlock(&mpam_srcu, idx);
 }
 
+static void mpam_resctrl_pick_mba(void)
+{
+	struct mpam_class *class, *candidate_class = NULL;
+	struct mpam_resctrl_res *res;
+	int idx;
+
+	lockdep_assert_cpus_held();
+
+	idx = srcu_read_lock(&mpam_srcu);
+	list_for_each_entry_rcu(class, &mpam_classes, classes_list) {
+		struct mpam_props *cprops = &class->props;
+
+		if (class->level < 3) {
+			pr_debug("pick_mba: class is before L3\n");
+			continue;
+		}
+
+		if (!class_has_usable_mba(cprops)) {
+			pr_debug("pick_mba: class has no bandwidth control\n");
+			continue;
+		}
+
+		if (!cpumask_equal(&class->affinity, cpu_possible_mask)) {
+			pr_debug("pick_mba: class has missing CPUs\n");
+			continue;
+		}
+
+		if (!topology_matches_l3(class)) {
+			pr_debug("pick_mba: class topology doesn't match L3\n");
+			continue;
+		}
+
+		/*
+		 * mba_sc reads the mbm_local counter, and waggles the MBA controls.
+		 * mbm_local is implicitly part of the L3, pick a resouce to be MBA
+		 * that as close as possible to the L3.
+		 */
+		if (!candidate_class || class->level < candidate_class->level)
+			candidate_class = class;
+	}
+	srcu_read_unlock(&mpam_srcu, idx);
+
+	if (candidate_class) {
+		res = &mpam_resctrl_controls[RDT_RESOURCE_MBA];
+		res->class = candidate_class;
+		exposed_alloc_capable = true;
+	}
+}
+
 static int mpam_resctrl_control_init(struct mpam_resctrl_res *res,
 				     enum resctrl_res_level type)
 {
 	struct mpam_class *class = res->class;
+	struct mpam_props *cprops = &class->props;
 	struct rdt_resource *r = &res->resctrl_res;
 
 	switch (res->resctrl_res.rid){
@@ -301,6 +537,23 @@ static int mpam_resctrl_control_init(struct mpam_resctrl_res *res,
 		 */
 		r->cache.shareable_bits = resctrl_get_default_ctrl(r);
 		break;
+	case RDT_RESOURCE_MBA:
+		r->alloc_capable = true;
+		r->schema_fmt = RESCTRL_SCHEMA_PERCENTAGE;
+
+		r->membw.delay_linear = true;
+		r->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
+		r->membw.min_bw = get_mba_granularity(cprops);
+		r->membw.max_bw = MAX_MBA_BW;
+		r->membw.bw_gran = get_mba_granularity(cprops);
+
+		r->name = "MB";
+
+		/* Round up to at least 1% */
+		if (!r->membw.bw_gran)
+			r->membw.bw_gran = 1;
+
+		break;
 	default:
 		break;
 	}
@@ -324,6 +577,7 @@ int mpam_resctrl_setup(void)
 
 	/* Find some classes to use for controls */
 	mpam_resctrl_pick_caches();
+	mpam_resctrl_pick_mba();
 
 	/* Initialise the resctrl structures from the classes */
 	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
@@ -383,6 +637,15 @@ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_domain *d,
 	case RDT_RESOURCE_L3:
 		configured_by = mpam_feat_cpor_part;
 		break;
+	case RDT_RESOURCE_MBA:
+		if (mba_class_use_mbw_part(cprops)) {
+			configured_by = mpam_feat_mbw_part;
+			break;
+		} else if (mpam_has_feature(mpam_feat_mbw_max, cprops)) {
+			configured_by = mpam_feat_mbw_max;
+			break;
+		}
+		fallthrough;
 	default:
 		return -EINVAL;
 	}
@@ -395,6 +658,11 @@ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_domain *d,
 	case mpam_feat_cpor_part:
 		/* TODO: Scaling is not yet supported */
 		return cfg->cpbm;
+	case mpam_feat_mbw_part:
+		/* TODO: Scaling is not yet supported */
+		return mbw_pbm_to_percent(cfg->mbw_pbm, cprops);
+	case mpam_feat_mbw_max:
+		return mbw_max_to_percent(cfg->mbw_max, cprops);
 	default:
 		return -EINVAL;
 	}
@@ -403,6 +671,7 @@ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_domain *d,
 int resctrl_arch_update_one(struct rdt_resource *r, struct rdt_domain *d,
 			    u32 closid, enum resctrl_conf_type t, u32 cfg_val)
 {
+	int err;
 	u32 partid;
 	struct mpam_config cfg;
 	struct mpam_props *cprops;
@@ -429,11 +698,37 @@ int resctrl_arch_update_one(struct rdt_resource *r, struct rdt_domain *d,
 		cfg.cpbm = cfg_val;
 		mpam_set_feature(mpam_feat_cpor_part, &cfg);
 		break;
+	case RDT_RESOURCE_MBA:
+		if (mba_class_use_mbw_part(cprops)) {
+			cfg.mbw_pbm = percent_to_mbw_pbm(cfg_val, cprops);
+			mpam_set_feature(mpam_feat_mbw_part, &cfg);
+			break;
+		} else if (mpam_has_feature(mpam_feat_mbw_max, cprops)) {
+			cfg.mbw_max = percent_to_mbw_max(cfg_val, cprops);
+			mpam_set_feature(mpam_feat_mbw_max, &cfg);
+			break;
+		}
+		fallthrough;
 	default:
 		return -EINVAL;
 	}
 
-	return mpam_apply_config(dom->comp, partid, &cfg);
+	/*
+	 * When CDP is enabled, but the resource doesn't support it, we need to
+	 * apply the same configuration to the other partid.
+	 */
+	if (mpam_resctrl_hide_cdp(r->rid)) {
+		partid = resctrl_get_config_index(closid, CDP_CODE);
+		err = mpam_apply_config(dom->comp, partid, &cfg);
+		if (err)
+			return err;
+
+		partid = resctrl_get_config_index(closid, CDP_DATA);
+		return mpam_apply_config(dom->comp, partid, &cfg);
+
+	} else {
+		return mpam_apply_config(dom->comp, partid, &cfg);
+	}
 }
 
 /* TODO: this is IPI heavy */
@@ -494,7 +789,7 @@ mpam_resctrl_alloc_domain(unsigned int cpu, struct mpam_resctrl_res *res)
 {
 	struct mpam_resctrl_dom *dom;
 	struct mpam_class *class = res->class;
-	struct mpam_component *comp_iter, *comp;
+	struct mpam_component *comp_iter, *comp, *l3_comp;
 
 	comp = NULL;
 	list_for_each_entry(comp_iter, &class->components, class_list) {
@@ -516,8 +811,14 @@ mpam_resctrl_alloc_domain(unsigned int cpu, struct mpam_resctrl_res *res)
 	INIT_LIST_HEAD(&dom->resctrl_dom.list);
 	if (class->type == MPAM_CLASS_CACHE) {
 		dom->resctrl_dom.id = comp->comp_id;
+	} else if (topology_matches_l3(class)) {
+		/* Use the corresponding L3 component ID as the domain ID */
+		l3_comp = __topology_l3_equivalent(cpu);
+		if (l3_comp)
+			dom->resctrl_dom.id = l3_comp->comp_id;
+		else
+			dom->resctrl_dom.id = comp->comp_id;
 	} else {
-		/* TODO: repaint domain ids to match the L3 domain ids */
 		/* TODO: if this matches the numa topology, use the nid to look
 		 * like SNC */
 		/*
