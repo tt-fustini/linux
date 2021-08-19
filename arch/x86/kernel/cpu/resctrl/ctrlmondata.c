@@ -543,16 +543,8 @@ void mon_event_read(struct rmid_read *rr, struct rdt_resource *r,
 	rr->val = 0;
 	rr->first = first;
 
-	cpu = get_cpu();
-	if (cpumask_test_cpu(cpu, &d->cpu_mask)) {
-		mon_event_count(rr);
-		put_cpu();
-	} else {
-		put_cpu();
-
-		cpu = cpumask_any_housekeeping(&d->cpu_mask);
-		smp_call_on_cpu(cpu, mon_event_count, rr, false);
-	}
+	cpu = cpumask_any_housekeeping(&d->cpu_mask);
+	smp_call_on_cpu(cpu, mon_event_count, rr, false);
 }
 
 int rdtgroup_mondata_show(struct seq_file *m, void *arg)
