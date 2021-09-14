@@ -247,6 +247,7 @@ struct arm_smmu_ste {
 #define STRTAB_STE_1_S1CSH		GENMASK_ULL(7, 6)
 
 #define STRTAB_STE_1_S1STALLD		(1UL << 27)
+#define STRTAB_STE_1_S1MPAM		(1UL << 26)
 
 #define STRTAB_STE_1_EATS		GENMASK_ULL(29, 28)
 #define STRTAB_STE_1_EATS_ABT		0UL
@@ -275,6 +276,10 @@ struct arm_smmu_ste {
 #define STRTAB_STE_2_S2R		(1UL << 58)
 
 #define STRTAB_STE_3_S2TTB_MASK		GENMASK_ULL(51, 4)
+
+#define STRTAB_STE_4_PARTID		GENMASK_ULL(31, 16)
+
+#define STRTAB_STE_5_PMG		GENMASK_ULL(7, 0)
 
 /*
  * Context descriptors.
@@ -722,6 +727,8 @@ struct arm_smmu_master {
 	bool				sva_enabled;
 	bool				iopf_enabled;
 	unsigned int			ssid_bits;
+	u16				partid;
+	u8				pmg;
 };
 
 /* SMMU private data for an IOMMU domain */
