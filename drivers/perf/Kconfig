@@ -203,4 +203,11 @@ source "drivers/perf/arm_cspmu/Kconfig"
 
 source "drivers/perf/amlogic/Kconfig"
 
+config RESCTRL_PMU
+	bool "Make resctrl counters accessible via perf"
+	depends on RESCTRL_FS
+	help
+	  Enable perf support for reading resctrl counters via perf. These
+	  counters are provided on hardware with Intel RDT, AMD QoS or ARM MPAM.
+
 endmenu
