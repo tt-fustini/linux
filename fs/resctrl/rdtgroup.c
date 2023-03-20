@@ -3590,7 +3590,8 @@ static int _resctrl_online_domain(struct rdt_resource *r, struct rdt_domain *d)
 
 	if (resctrl_is_mbm_enabled()) {
 		INIT_DELAYED_WORK(&d->mbm_over, mbm_handle_overflow);
-		mbm_setup_overflow_handler(d, MBM_OVERFLOW_INTERVAL, -1);
+		mbm_setup_overflow_handler(d, MBM_OVERFLOW_INTERVAL,
+					   RESCTRL_PICK_ANY_CPU);
 	}
 
 	if (resctrl_arch_is_llc_occupancy_enabled())
