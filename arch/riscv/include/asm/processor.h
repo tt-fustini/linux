@@ -39,6 +39,9 @@ struct thread_struct {
 	unsigned long s[12];	/* s[0]: frame pointer */
 	struct __riscv_d_ext_state fstate;
 	unsigned long bad_cause;
+#ifdef CONFIG_RISCV_ISA_SSQOSID
+	u32 sqoscfg;
+#endif
 };
 
 /* Whitelist the fstate from the task_struct for hardened usercopy */
