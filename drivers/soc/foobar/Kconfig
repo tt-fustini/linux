@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config FOOBAR_CBQRI_CACHE
+	bool "Foobar cache controller for RISC-V CBQRI testing"
+	default y
+	help
+	  Support the cache controller in a hypothetical "Foobar" SoC that
+	  implements the RISC-V Capacity and Bandwidth QoS Register Interface
+	  (CBQRI) specification.
+
+	  If you do not care about testing RISC-V CBQRI, then choose 'N'.
+
+config FOOBAR_CBQRI_MEMORY
+	bool "Foobar memory controller for RISC-V CBQRI testing"
+	default y
+	help
+	  Support the memory controller in a hypothetical "Foobar" SoC that
+	  implements the RISC-V Capacity and Bandwidth QoS Register Interface
+	  (CBQRI) specification.
+
+	  If you do not care about testing RISC-V CBQRI, then choose 'N'.
