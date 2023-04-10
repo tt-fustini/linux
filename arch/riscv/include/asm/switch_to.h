@@ -12,6 +12,7 @@
 #include <asm/processor.h>
 #include <asm/ptrace.h>
 #include <asm/csr.h>
+#include <asm/qos.h>
 
 #ifdef CONFIG_FPU
 extern void __fstate_save(struct task_struct *save_to);
@@ -78,6 +79,8 @@ do {							\
 	struct task_struct *__next = (next);		\
 	if (has_fpu())					\
 		__switch_to_aux(__prev, __next);	\
+	if (has_sqoscfg())				\
+		__switch_to_sqoscfg(__prev, __next);	\
 	((last) = __switch_to(__prev, __next));		\
 } while (0)
 
