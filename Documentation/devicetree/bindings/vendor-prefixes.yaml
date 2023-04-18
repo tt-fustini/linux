@@ -470,6 +470,8 @@ patternProperties:
     description: Shenzhen Fly Young Technology Co.,LTD.
   "^fii,.*":
     description: Foxconn Industrial Internet
+  "^foobar,.*":
+    description: Foobar Systems
   "^firefly,.*":
     description: Firefly
   "^focaltech,.*":
