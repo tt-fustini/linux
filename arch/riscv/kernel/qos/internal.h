@@ -65,6 +65,11 @@
 #define CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT   2
 #define CBQRI_BC_ALLOC_CTL_STATUS_SUCCESS  1
 
+int qos_resctrl_setup(void);
+void qos_resctrl_exit(void);
+int qos_resctrl_online_cpu(unsigned int cpu);
+int qos_resctrl_offline_cpu(unsigned int cpu);
+
 /* Capacity Controller hardware capabilities */
 /* from qemu/include/hw/riscv/cbqri.h */
 struct riscv_cbqri_capacity_caps {
@@ -125,6 +130,28 @@ struct cbqri_controller {
 
 	bool alloc_capable;
 	bool mon_capable;
+};
+
+struct cbqri_resctrl_res {
+	struct rdt_resource     resctrl_res;
+	struct cbqri_controller controller;
+	u32 max_rcid;
+	u32 max_mcid;
+};
+
+struct cbqri_resctrl_dom {
+	struct rdt_domain       resctrl_dom;
+	// NCBLKS is 16 bit which is 2^16 = 65536
+	// If each bit is a block, then cc_block_mask could 1024 times 64 byte
+	u64 cbm;
+	u64 rbwb;
+	u64 *ctrl_val;
+	struct cbqri_controller *hw_ctrl;
+};
+
+struct cbqri_config {
+	u64 cbm; /* capacity block mask */
+	u64 rbwb; /* reserved bandwidth blocks */
 };
 
 #endif /* _ASM_RISCV_QOS_INTERNAL_H */
