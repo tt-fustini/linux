@@ -21703,6 +21703,7 @@ M:	Drew Fustini <fustini@kernel.org>
 L:	linux-riscv@lists.infradead.org
 S:	Supported
 F:	arch/riscv/include/asm/qos.h
+F:	include/linux/riscv_qos.h
 
 RISC-V SPACEMIT SoC Support
 M:	Yixun Lan <dlan@gentoo.org>
