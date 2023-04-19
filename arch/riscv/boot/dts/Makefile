@@ -3,6 +3,7 @@ subdir-y += allwinner
 subdir-y += andes
 subdir-y += canaan
 subdir-y += microchip
+subdir-y += qemu
 subdir-y += renesas
 subdir-y += sifive
 subdir-y += sophgo
