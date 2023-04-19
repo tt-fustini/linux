@@ -367,5 +367,64 @@
 			reg = <0x00 0x2000000 0x00 0x10000>;
 			compatible = "sifive,clint0\0riscv,clint0";
 		};
+
+		cluster0_l2: controller@4820000 {
+			compatible = "foobar,cache-controller";
+			reg = <0x0 0x4820000 0x0 0x1000>; /* 4KB at 0x04820000 */
+			cache-unified;
+			cache-line-size = <64>;
+			cache-level = <2>;
+			cache-sets = <1000>;
+			cache-size = <768000>; /* 750 KiB */
+			next-level-cache = <&shared_llc>;
+			riscv,cbqri-rcid = <64>;
+			riscv,cbqri-mcid = <256>;
+		};
+
+		cluster1_l2: controller@4821000 {
+			compatible = "foobar,cache-controller";
+			reg = <0x0 0x4821000 0x0 0x1000>; /* 4KB at 0x04821000 */
+			cache-unified;
+			cache-line-size = <64>;
+			cache-level = <2>;
+			cache-sets = <1000>;
+			cache-size = <768000>; /* 750 KiB */
+			next-level-cache = <&shared_llc>;
+			riscv,cbqri-rcid = <64>;
+			riscv,cbqri-mcid = <256>;
+		};
+
+		shared_llc: controller@482b000 {
+			compatible = "foobar,cache-controller";
+			reg = <0x0 0x482b000 0x0 0x1000>; /* 4KB at 0x0482B000 */
+			cache-unified;
+			cache-line-size = <64>;
+			cache-level = <3>;
+			cache-sets = <4096>;
+			cache-size = <3145728>; /* 3 MiB */
+			riscv,cbqri-rcid = <64>;
+			riscv,cbqri-mcid = <256>;
+		};
+
+		mem0: controller@4828000 {
+			compatible = "foobar,memory-controller";
+			reg = <0x0 0x4828000 0x0 0x1000>; /* 4KB at 0x04828000 */
+			riscv,cbqri-rcid = <64>;
+			riscv,cbqri-mcid = <256>;
+		};
+
+		mem1: controller@4829000 {
+			compatible = "foobar,memory-controller";
+			reg = <0x0 0x4829000 0x0 0x1000>; /* 4KB at 0x04829000 */
+			riscv,cbqri-rcid = <64>;
+			riscv,cbqri-mcid = <256>;
+		};
+
+		mem2: controller@482a000 {
+			compatible = "foobar,memory-controller";
+			reg = <0x0 0x482a000 0x0 0x1000>; /* 4KB at 0x0482A000 */
+			riscv,cbqri-rcid = <64>;
+			riscv,cbqri-mcid = <256>;
+		};
 	};
 };
