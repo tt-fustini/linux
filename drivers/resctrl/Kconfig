@@ -22,3 +22,5 @@ config MPAM_KUNIT_TEST
 	  If unsure, say N.
 
 endif
+
+source "drivers/resctrl/riscv/Kconfig"

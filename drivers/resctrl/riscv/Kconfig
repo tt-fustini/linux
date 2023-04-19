@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config RESCTRL_RISCV_CBQRI_CACHE
+	bool "RISC-V QoS cache controller (CBQRI)"
+	default y
+	depends on RISCV
+	select RISCV_ISA_SSQOSID
+	help
+	  Support RISC-V platform which implements a QoS capacity
+	  controller according to the RISC-V Capacity and Bandwidth QoS
+	  Register Interface (CBQRI) specification.
+
+	  If you do not care about testing RISC-V CBQRI, then choose 'N'.
+
+config RESCTRL_RISCV_CBQRI_BANDWIDTH
+	bool "RISC-V QoS bandwidth controller (CBQRI)"
+	default y
+	depends on RISCV
+	select RISCV_ISA_SSQOSID
+	help
+	  Support RISC-V platform which implements a QoS bandwidth
+	  controller according to the RISC-V Capacity and Bandwidth QoS
+	  Register Interface (CBQRI) specification.
+
+	  If you do not care about testing RISC-V CBQRI, then choose 'N'.
