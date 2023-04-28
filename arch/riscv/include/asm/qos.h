@@ -23,6 +23,8 @@ static inline void __switch_to_sqoscfg(struct task_struct *prev,
 	thread_sqoscfg = READ_ONCE(next->thread.sqoscfg);
 
 	if (thread_sqoscfg != *cpu_sqoscfg_ptr) {
+		trace_printk("DEBUG %s(): next task (%d) has thread.sqoscfg=0x%x, current cpu has sqoscfg=0x%x\n",
+			     __func__,  next->pid, thread_sqoscfg, *cpu_sqoscfg_ptr);
 		*cpu_sqoscfg_ptr = thread_sqoscfg;
 		csr_write(CSR_SQOSCFG, thread_sqoscfg);
 	}
