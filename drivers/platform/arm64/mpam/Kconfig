@@ -3,6 +3,7 @@ config ARM64_MPAM_DRIVER
 	depends on ARM64_MPAM
 	select ACPI_MPAM if ACPI
 	select RESCTRL_RMID_DEPENDS_ON_CLOSID if RESCTRL_FS
+	select RESCTRL_IOMMU if ARM_SMMU_V3
 
 config MPAM_KUNIT_TEST
 	bool "KUnit tests for MPAM driver " if !KUNIT_ALL_TESTS
