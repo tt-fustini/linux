@@ -2659,11 +2659,61 @@ static int mpam_allocate_config(void)
 	return 0;
 }
 
+struct msmon_debug {
+	struct mpam_msc_ris *ris;
+	u32		     mon;
+};
+
+#define MSMON_DEBUG_ACCESS(x, X)					\
+static int do_msmon_##x##_access(void *arg)				\
+{									\
+	struct seq_file *m = arg;					\
+	struct msmon_debug *msmon_debug_private = m->private;		\
+	struct mpam_msc_ris *ris = msmon_debug_private->ris;		\
+	int mon = msmon_debug_private->mon;				\
+	struct mpam_msc *msc = ris->vmsc->msc;				\
+	unsigned long flags;						\
+	u64 val, mon_sel;						\
+									\
+	spin_lock_irqsave(&msc->mon_sel_lock, flags);			\
+	mon_sel = FIELD_PREP(MSMON_CFG_MON_SEL_MON_SEL, mon) |		\
+		  FIELD_PREP(MSMON_CFG_MON_SEL_RIS, ris->ris_idx);	\
+	mpam_write_monsel_reg(msc, CFG_MON_SEL, mon_sel);		\
+									\
+	val = mpam_read_monsel_reg(msc, X);				\
+	spin_unlock_irqrestore(&msc->mon_sel_lock, flags);		\
+									\
+	seq_printf(m, "0x%llx\n", val);					\
+									\
+	return 0;							\
+}									\
+static int hw_msmon_##x##_show(struct seq_file *m, void *v)		\
+{									\
+	struct msmon_debug *msmon_debug_private = m->private;		\
+	struct mpam_msc_ris *ris = msmon_debug_private->ris;		\
+	int mon = msmon_debug_private->mon;				\
+	struct mpam_msc *msc = ris->vmsc->msc;				\
+									\
+	if (mon > ris->props.num_csu_mon)				\
+		return -EIO;						\
+									\
+	return mpam_touch_msc(msc, do_msmon_##x##_access, m);		\
+}									\
+DEFINE_SHOW_ATTRIBUTE(hw_msmon_##x);
+
+MSMON_DEBUG_ACCESS(csu, CSU);
+MSMON_DEBUG_ACCESS(cfg_csu_flt, CFG_CSU_FLT);
+MSMON_DEBUG_ACCESS(cfg_csu_ctl, CFG_CSU_CTL);
+
 static void mpam_debugfs_setup_ris(struct mpam_msc_ris *ris)
 {
+	int i;
+	u8 num_mon;
 	char name[40];
 	struct dentry *d;
 	struct mpam_props *rprops = &ris->props;
+
+	num_mon = rprops->num_csu_mon;
 
 	snprintf(name, sizeof(name), "ris.%u", ris->ris_idx);
 	d = debugfs_create_dir(name, ris->vmsc->msc->debugfs);
@@ -2675,6 +2725,25 @@ static void mpam_debugfs_setup_ris(struct mpam_msc_ris *ris)
 	debugfs_create_x16("num_mbwu_mon", 0400, d, &rprops->num_mbwu_mon);
 	debugfs_create_cpumask("affinity", 0400, d, &ris->affinity);
 	ris->debugfs = d;
+
+	for (i = 0; i <= num_mon; i++) {
+		struct msmon_debug *msmon_debug_private;
+
+		msmon_debug_private = kzalloc(sizeof(*msmon_debug_private), GFP_KERNEL);
+		if (!msmon_debug_private)
+			return;
+		msmon_debug_private->ris = ris;
+		msmon_debug_private->mon = i;
+
+		snprintf(name, sizeof(name), "mon.%u", i);
+		d = debugfs_create_dir(name, ris->debugfs);
+		debugfs_create_file("hw_msmon_csu", 0600, d,
+				    msmon_debug_private, &hw_msmon_csu_fops);
+		debugfs_create_file("hw_msmon_cfg_csu_flt", 0600, d,
+				    msmon_debug_private, &hw_msmon_cfg_csu_flt_fops);
+		debugfs_create_file("hw_msmon_cfg_csu_ctl", 0600, d,
+				    msmon_debug_private, &hw_msmon_cfg_csu_ctl_fops);
+	}
 }
 
 static void mpam_debugfs_setup_vmsc(struct mpam_component *comp,
