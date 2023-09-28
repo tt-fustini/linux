@@ -2016,8 +2016,13 @@ static int mpam_msc_drv_probe(struct platform_device *pdev)
 			break;
 		}
 
-		INIT_LIST_HEAD_RCU(&msc->glbl_list);
+		mutex_init(&msc->lock);
+		msc->id = mpam_num_msc++;
 		msc->pdev = pdev;
+		INIT_LIST_HEAD_RCU(&msc->glbl_list);
+		INIT_LIST_HEAD_RCU(&msc->ris);
+		spin_lock_init(&msc->part_sel_lock);
+		spin_lock_init(&msc->mon_sel_lock);
 
 		err = get_msc_affinity(msc);
 		if (err)
@@ -2029,18 +2034,9 @@ static int mpam_msc_drv_probe(struct platform_device *pdev)
 			break;
 		}
 
-		mutex_init(&msc->lock);
-		msc->id = mpam_num_msc++;
-		INIT_LIST_HEAD_RCU(&msc->ris);
-		spin_lock_init(&msc->part_sel_lock);
-		spin_lock_init(&msc->mon_sel_lock);
-
 		err = mpam_msc_setup_error_irq(msc);
-		if (err) {
-			devm_kfree(&pdev->dev, msc);
-			msc = ERR_PTR(err);
+		if (err)
 			break;
-		}
 
 		if (device_property_read_u32(&pdev->dev, "pcc-channel",
 					     &msc->pcc_subspace_id))
@@ -2053,7 +2049,6 @@ static int mpam_msc_drv_probe(struct platform_device *pdev)
 								    &msc_res);
 			if (IS_ERR(io)) {
 				pr_err("Failed to map MSC base address\n");
-				devm_kfree(&pdev->dev, msc);
 				err = PTR_ERR(io);
 				break;
 			}
@@ -2070,7 +2065,6 @@ static int mpam_msc_drv_probe(struct platform_device *pdev)
 								 msc->pcc_subspace_id);
 			if (IS_ERR(msc->pcc_chan)) {
 				pr_err("Failed to request MSC PCC channel\n");
-				devm_kfree(&pdev->dev, msc);
 				err = PTR_ERR(msc->pcc_chan);
 				break;
 			}
@@ -2081,7 +2075,6 @@ static int mpam_msc_drv_probe(struct platform_device *pdev)
 			if (IS_ERR(io)) {
 				pr_err("Failed to map MSC base address\n");
 				pcc_mbox_free_channel(msc->pcc_chan);
-				devm_kfree(&pdev->dev, msc);
 				err = PTR_ERR(io);
 				break;
 			}
@@ -2111,6 +2104,16 @@ static int mpam_msc_drv_probe(struct platform_device *pdev)
 
 	if (!err && fw_num_msc == mpam_num_msc)
 		mpam_register_cpuhp_callbacks(&mpam_discovery_cpu_online);
+
+	if (err && msc) {
+		mutex_lock(&mpam_list_lock);
+		platform_set_drvdata(pdev, NULL);
+		list_del_rcu(&msc->glbl_list);
+		mpam_msc_destroy(msc);
+		mutex_unlock(&mpam_list_lock);
+
+		devm_kfree(&pdev->dev, msc);
+	}
 
 	return err;
 }
@@ -2819,7 +2822,6 @@ static int mpam_msc_drv_remove(struct platform_device *pdev)
 	platform_set_drvdata(pdev, NULL);
 	list_del_rcu(&msc->glbl_list);
 	mpam_msc_destroy(msc);
-	synchronize_srcu(&mpam_srcu);
 	mutex_unlock(&mpam_list_lock);
 
 	return 0;
