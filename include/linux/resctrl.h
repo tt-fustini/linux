@@ -119,7 +119,7 @@ struct resctrl_staged_config {
  */
 struct rdt_domain {
 	struct list_head		list;
-	int				id;
+	u32						id;
 	struct cpumask			cpu_mask;
 	unsigned long			*rmid_busy_llc;
 	struct mbm_state		*mbm_total;
