@@ -79,6 +79,9 @@ struct mpam_msc
 	size_t			mapped_hwpage_sz;
 
 	struct dentry		*debugfs;
+
+	/* Values only used on some plaftorms for quirks */
+	u32			t241_id;
 };
 
 /*
@@ -145,6 +148,7 @@ static inline void mpam_clear_feature(enum mpam_device_features feat,
 
 /* Workaround bits for msc->quirks */
 enum mpam_device_quirks {
+	T241_SCRUB_SHADOW_REGS,
 	MPAM_QUIRK_LAST,
 };
 
