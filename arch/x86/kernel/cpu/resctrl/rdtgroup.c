@@ -4168,9 +4168,15 @@ int __init resctrl_init(void)
 
 	rdtgroup_setup_default();
 
-	ret = sysfs_create_mount_point(fs_kobj, "resctrl");
+	ret = resctrl_mon_resource_init();
 	if (ret)
 		return ret;
+
+	ret = sysfs_create_mount_point(fs_kobj, "resctrl");
+	if (ret) {
+		resctrl_mon_resource_exit();
+		return ret;
+	}
 
 	ret = register_filesystem(&rdt_fs_type);
 	if (ret)
@@ -4203,6 +4209,7 @@ int __init resctrl_init(void)
 
 cleanup_mountpoint:
 	sysfs_remove_mount_point(fs_kobj, "resctrl");
+	resctrl_mon_resource_exit();
 
 	return ret;
 }
