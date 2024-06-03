@@ -71,7 +71,6 @@ struct rdt_hw_resource rdt_resources_all[] = {
 			.schema_fmt		= RESCTRL_SCHEMA_BITMAP,
 			.cache_level		= 3,
 			.domains		= domain_init(RDT_RESOURCE_L3),
-			.format_str		= "%d=%0*x",
 		},
 		.msr_base		= MSR_IA32_L3_CBM_BASE,
 		.msr_update		= cat_wrmsr,
@@ -84,7 +83,6 @@ struct rdt_hw_resource rdt_resources_all[] = {
 			.schema_fmt		= RESCTRL_SCHEMA_BITMAP,
 			.cache_level		= 2,
 			.domains		= domain_init(RDT_RESOURCE_L2),
-			.format_str		= "%d=%0*x",
 		},
 		.msr_base		= MSR_IA32_L2_CBM_BASE,
 		.msr_update		= cat_wrmsr,
@@ -101,7 +99,6 @@ struct rdt_hw_resource rdt_resources_all[] = {
 			.schema_fmt		= RESCTRL_SCHEMA_PERCENTAGE,
 			.cache_level		= 3,
 			.domains		= domain_init(RDT_RESOURCE_MBA),
-			.format_str		= "%d=%*u",
 		},
 	},
 	[RDT_RESOURCE_SMBA] =
@@ -112,7 +109,6 @@ struct rdt_hw_resource rdt_resources_all[] = {
 			.schema_fmt		= RESCTRL_SCHEMA_MBPS,
 			.cache_level		= 3,
 			.domains		= domain_init(RDT_RESOURCE_SMBA),
-			.format_str		= "%d=%*u",
 		},
 	},
 };
