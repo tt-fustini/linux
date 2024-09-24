@@ -1308,7 +1308,7 @@ void resctrl_arch_reset_resources(void)
 
 		idx = srcu_read_lock(&mpam_srcu);
 		list_for_each_entry_rcu(class, &mpam_classes, classes_list)
-			mpam_reset_class(class);
+			mpam_reset_class_locked(class);
 		srcu_read_unlock(&mpam_srcu, idx);
 	}
 }
