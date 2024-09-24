@@ -3047,7 +3047,7 @@ static void mpam_enable_once(void)
 		READ_ONCE(mpam_partid_max) + 1, mpam_pmg_max + 1);
 }
 
-void mpam_reset_class(struct mpam_class *class)
+void mpam_reset_class_locked(struct mpam_class *class)
 {
 	int idx;
 	struct mpam_msc *msc;
@@ -3055,7 +3055,8 @@ void mpam_reset_class(struct mpam_class *class)
 	struct mpam_msc_ris *ris;
 	struct mpam_component *comp;
 
-	cpus_read_lock();
+	lockdep_assert_cpus_held();
+
 	idx = srcu_read_lock(&mpam_srcu);
 	list_for_each_entry_rcu(comp, &class->components, class_list) {
 		memset(comp->cfg, 0, (mpam_partid_max * sizeof(*comp->cfg)));
@@ -3071,6 +3072,13 @@ void mpam_reset_class(struct mpam_class *class)
 		}
 	}
 	srcu_read_unlock(&mpam_srcu, idx);
+}
+
+
+void mpam_reset_class(struct mpam_class *class)
+{
+	cpus_read_lock();
+	mpam_reset_class_locked(class);
 	cpus_read_unlock();
 }
 
