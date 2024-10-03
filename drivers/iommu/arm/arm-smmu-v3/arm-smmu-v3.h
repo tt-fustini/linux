@@ -235,6 +235,11 @@ static inline u32 arm_smmu_strtab_l2_idx(u32 sid)
 	return sid % STRTAB_NUM_L2_STES;
 }
 
+static inline unsigned int arm_smmu_strtab_max_sid(unsigned int sid_bits)
+{
+	return (1UL << sid_bits);
+}
+
 #define STRTAB_STE_0_V			(1UL << 0)
 #define STRTAB_STE_0_CFG		GENMASK_ULL(3, 1)
 #define STRTAB_STE_0_CFG_ABORT		0

@@ -3624,8 +3624,8 @@ static int arm_smmu_init_strtab_2lvl(struct arm_smmu_device *smmu)
 {
 	u32 l1size;
 	struct arm_smmu_strtab_cfg *cfg = &smmu->strtab_cfg;
-	unsigned int last_sid_idx =
-		arm_smmu_strtab_l1_idx((1 << smmu->sid_bits) - 1);
+	unsigned int max_sid = arm_smmu_strtab_max_sid(smmu->sid_bits);
+	unsigned int last_sid_idx = arm_smmu_strtab_l1_idx(max_sid - 1);
 
 	/* Calculate the L1 size, capped to the SIDSIZE. */
 	cfg->l2.num_l1_ents = min(last_sid_idx + 1, STRTAB_MAX_L1_ENTRIES);
@@ -3657,8 +3657,9 @@ static int arm_smmu_init_strtab_linear(struct arm_smmu_device *smmu)
 {
 	u32 size;
 	struct arm_smmu_strtab_cfg *cfg = &smmu->strtab_cfg;
+	unsigned int max_sid = arm_smmu_strtab_max_sid(smmu->sid_bits);
 
-	size = (1 << smmu->sid_bits) * sizeof(struct arm_smmu_ste);
+	size = max_sid * sizeof(struct arm_smmu_ste);
 	cfg->linear.table = dmam_alloc_coherent(smmu->dev, size,
 						&cfg->linear.ste_dma,
 						GFP_KERNEL);
