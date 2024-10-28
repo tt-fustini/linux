@@ -48,8 +48,9 @@ struct rdt_resource;
 bool resctrl_arch_get_cdp_enabled(enum resctrl_res_level ignored);
 bool resctrl_arch_match_closid(struct task_struct *tsk, u32 closid);
 bool resctrl_arch_match_rmid(struct task_struct *tsk, u32 closid, u32 rmid);
-int  resctrl_arch_mon_ctx_alloc_no_wait(struct rdt_resource *r, int evtid);
-void resctrl_arch_mon_ctx_free(struct rdt_resource *r, int evtid, int ctx);
+void *resctrl_arch_mon_ctx_alloc(struct rdt_resource *r, enum resctrl_event_id evtid);
+void resctrl_arch_mon_ctx_free(struct rdt_resource *r, enum resctrl_event_id evtid, void *arch_mon_ctx);
+
 void resctrl_arch_reset_resources(void);
 void resctrl_arch_rmid_idx_decode(u32 idx, u32 *closid, u32 *rmid);
 u32  resctrl_arch_rmid_idx_encode(u32 closid, u32 rmid);
@@ -59,6 +60,7 @@ void resctrl_arch_set_cpu_default_closid(int cpu, u32 closid);
 void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid, u32 pmg);
 u32  resctrl_arch_system_num_rmid_idx(void);
 void resctrl_sched_in(void);
+void resctrl_arch_sched_in(struct task_struct *tsk);
 
 static inline bool resctrl_arch_event_is_free_running(enum resctrl_event_id evt)
 {
