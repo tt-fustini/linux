@@ -140,7 +140,9 @@ struct cbqri_resctrl_res {
 };
 
 struct cbqri_resctrl_dom {
-	struct rdt_domain       resctrl_dom;
+	struct rdt_domain_hdr       resctrl_dom_hdr;
+	struct rdt_ctrl_domain  resctrl_ctrl_dom;
+	struct rdt_mon_domain   resctrl_mon_dom;
 	// NCBLKS is 16 bit which is 2^16 = 65536
 	// If each bit is a block, then cc_block_mask could 1024 times 64 byte
 	u64 cbm;
