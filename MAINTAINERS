@@ -21705,6 +21705,7 @@ S:	Supported
 F:	arch/riscv/kernel/qos/
 F:	arch/riscv/include/asm/qos.h
 F:	arch/riscv/include/asm/resctrl.h
+F:	drivers/acpi/riscv/rqsc.c
 F:	include/linux/riscv_qos.h
 
 RISC-V SPACEMIT SoC Support
