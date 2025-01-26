@@ -53,6 +53,7 @@
 #define ACPI_SIG_RGRT           "RGRT"	/* Regulatory Graphics Resource Table */
 #define ACPI_SIG_RHCT           "RHCT"	/* RISC-V Hart Capabilities Table */
 #define ACPI_SIG_RIMT           "RIMT"	/* RISC-V IO Mapping Table */
+#define ACPI_SIG_RQSC           "RQSC"	/* RISC-V RISC-V Quality of Service Controller */
 #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
 #define ACPI_SIG_SDEI           "SDEI"	/* Software Delegated Exception Interface Table */
 #define ACPI_SIG_SDEV           "SDEV"	/* Secure Devices table */
@@ -3163,6 +3164,97 @@ enum acpi_rgrt_image_type {
 	ACPI_RGRT_TYPE_RESERVED0 = 0,
 	ACPI_RGRT_IMAGE_TYPE_PNG = 1,
 	ACPI_RGRT_TYPE_RESERVED = 2	/* 2 and greater are reserved */
+};
+
+/*******************************************************************************
+ *
+ * RQSC - RISC-V Quality of Service Controller
+ *        Version 1
+ *
+ ******************************************************************************/
+
+struct acpi_table_rqsc_fields_res {
+	u8 type;	// 1
+	u8 resv;	// 1
+	u16 length;	// 2
+	u16 flags;	// 2
+	u8 resv2;	// 1
+	u8 id_type;	// 1
+	u64 id1;	// 8
+	u32 id2;	// 4
+};
+
+struct acpi_table_rqsc_fields {
+	u8 type;	//  1
+	u8 resv;	//  1
+	u16 length;	//  2
+	u32 reg[3];	// 12
+	u32 rcid;	//  4
+	u32 mcid;	//  4
+	u16 flags;	//  2
+	u16 nres;	//  2
+	struct acpi_table_rqsc_fields_res res; // 20
+};
+
+struct acpi_table_rqsc {
+	struct acpi_table_header header;	/* Common ACPI table header */
+	u32 num;
+	struct acpi_table_rqsc_fields f[6];
+};
+
+/* RQSC Flags */
+#define ACPI_RQSC_TIMER_CANNOT_WAKEUP_CPU       (1)
+
+/*
+ * RQSC subtables
+ */
+struct acpi_rqsc_node_header {
+	u16 type;
+	u16 length;
+	u16 revision;
+};
+
+/* Values for RQSC subtable Type above */
+enum acpi_rqsc_node_type {
+	ACPI_RQSC_NODE_TYPE_ISA_STRING = 0x0000,
+	ACPI_RQSC_NODE_TYPE_CMO = 0x0001,
+	ACPI_RQSC_NODE_TYPE_MMU = 0x0002,
+	ACPI_RQSC_NODE_TYPE_RESERVED = 0x0003,
+	ACPI_RQSC_NODE_TYPE_HART_INFO = 0xFFFF,
+};
+
+/*
+ * RQSC node specific subtables
+ */
+
+/* ISA string node structure */
+struct acpi_rqsc_isa_string {
+	u16 isa_length;
+	char isa[];
+};
+
+struct acpi_rqsc_cmo_node {
+	u8 reserved;		/* Must be zero */
+	u8 cbom_size;		/* CBOM size in powerof 2 */
+	u8 cbop_size;		/* CBOP size in powerof 2 */
+	u8 cboz_size;		/* CBOZ size in powerof 2 */
+};
+
+struct acpi_rqsc_mmu_node {
+	u8 reserved;		/* Must be zero */
+	u8 mmu_type;		/* Virtual Address Scheme */
+};
+
+enum acpi_rqsc_mmu_type {
+	ACPI_RQSC_MMU_TYPE_SV39 = 0,
+	ACPI_RQSC_MMU_TYPE_SV48 = 1,
+	ACPI__MMU_TYPE_SV57 = 2
+};
+
+/* Hart Info node structure */
+struct acpi_rqsc_hart_info {
+	u16 num_offsets;
+	u32 uid;		/* ACPI processor UID */
 };
 
 /*******************************************************************************
