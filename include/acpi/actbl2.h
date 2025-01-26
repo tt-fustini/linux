@@ -53,6 +53,7 @@
 #define ACPI_SIG_RGRT           "RGRT"	/* Regulatory Graphics Resource Table */
 #define ACPI_SIG_RHCT           "RHCT"	/* RISC-V Hart Capabilities Table */
 #define ACPI_SIG_RIMT           "RIMT"	/* RISC-V IO Mapping Table */
+#define ACPI_SIG_RQSC           "RQSC"	/* RISC-V RISC-V Quality of Service Controller */
 #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
 #define ACPI_SIG_SDEI           "SDEI"	/* Software Delegated Exception Interface Table */
 #define ACPI_SIG_SDEV           "SDEV"	/* Secure Devices table */
@@ -3163,6 +3164,41 @@ enum acpi_rgrt_image_type {
 	ACPI_RGRT_TYPE_RESERVED0 = 0,
 	ACPI_RGRT_IMAGE_TYPE_PNG = 1,
 	ACPI_RGRT_TYPE_RESERVED = 2	/* 2 and greater are reserved */
+};
+
+/*******************************************************************************
+ *
+ * RQSC - RISC-V Quality of Service Controller
+ *        Version 1
+ *
+ ******************************************************************************/
+
+struct acpi_table_rqsc_fields_res {
+	u8 type;	// 1
+	u8 resv;	// 1
+	u16 length;	// 2
+	u16 flags;	// 2
+	u8 resv2;	// 1
+	u8 id_type;	// 1
+	u64 id1;	// 8
+	u32 id2;	// 4
+};
+
+struct acpi_table_rqsc_fields {
+	u8 type;	//  1
+	u8 resv;	//  1
+	u16 length;	//  2
+	u32 reg[3];	// 12
+	u16 rcid;	//  2
+	u16 mcid;	//  2
+	u16 flags;	//  2
+	u16 nres;	//  2
+	struct acpi_table_rqsc_fields_res res; // 20
+};
+
+struct acpi_table_rqsc {
+	struct acpi_table_header header;	/* Common ACPI table header */
+	u32 num;
 };
 
 /*******************************************************************************
