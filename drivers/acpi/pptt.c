@@ -1063,3 +1063,66 @@ int acpi_pptt_get_cpumask_from_cache_id(u32 cache_id, cpumask_t *cpus)
 
 	return 0;
 }
+
+/*
+ * find_acpi_cache_from_id() is adapted from find_acpi_cache_level_from_id()
+ * introduced by c4170570cc7f ("ACPI / PPTT: Find PPTT cache level by ID")
+ * in the morse/mpam/snapshot/v6.14-rc1 branch.
+ *
+ * TODO: find_acpi_cache_level_from_id() has changed since then so this
+ * function should be updated. In additon, there may be a simpler way for
+ * acpi_parse_rqsc() than adding this function to get a pointer to
+ * acpi_pptt_cache.
+ */
+struct acpi_pptt_cache *find_acpi_cache_from_id(u32 cache_id)
+{
+	u32 acpi_cpu_id;
+	acpi_status status;
+	int level, cpu, num_levels;
+	struct acpi_pptt_cache *cache;
+	struct acpi_table_header *table;
+	struct acpi_pptt_cache_v1 *cache_v1;
+	struct acpi_pptt_processor *cpu_node;
+
+	status = acpi_get_table(ACPI_SIG_PPTT, 0, &table);
+	if (ACPI_FAILURE(status)) {
+		acpi_pptt_warn_missing();
+		return NULL;
+	}
+
+	if (table->revision < 3) {
+		acpi_put_table(table);
+		return NULL;
+	}
+
+	for_each_possible_cpu(cpu) {
+		num_levels = 0;
+		acpi_cpu_id = get_acpi_id_for_cpu(cpu);
+
+		cpu_node = acpi_find_processor_node(table, acpi_cpu_id);
+		if (!cpu_node)
+			break;
+		num_levels = acpi_count_levels(table, cpu_node, NULL);
+
+		for (level = 1; level <= num_levels; level++) {
+			cache = acpi_find_cache_node(table, acpi_cpu_id,
+						     ACPI_PPTT_CACHE_TYPE_UNIFIED,
+						     level, &cpu_node);
+			if (!cache)
+				continue;
+
+			cache_v1 = ACPI_ADD_PTR(struct acpi_pptt_cache_v1,
+						cache,
+						sizeof(struct acpi_pptt_cache));
+
+			if (cache->flags & ACPI_PPTT_CACHE_ID_VALID &&
+			    cache_v1->cache_id == cache_id) {
+				acpi_put_table(table);
+				return cache;
+			}
+		}
+	}
+
+	acpi_put_table(table);
+	return NULL;
+}
