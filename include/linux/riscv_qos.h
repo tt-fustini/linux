@@ -27,7 +27,14 @@ struct cbqri_controller_info {
 		u32 cache_level;
 		u32 cache_size; /* in bytes */
 		struct cpumask cpu_mask;
+		// Unique Cache ID from the PPTT table's Cache Type Structure
+		u32 cache_id;
 	} cache;
+
+	struct mem_controller {
+		// Proximity Domain from SRAT table Memory Affifinty Controller
+		u32 prox_dom;
+	} mem;
 };
 
 extern struct list_head cbqri_controllers;
