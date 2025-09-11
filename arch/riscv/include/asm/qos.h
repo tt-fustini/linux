@@ -22,6 +22,9 @@ static inline void __switch_to_srmcfg(struct task_struct *next)
 	thread_srmcfg = READ_ONCE(next->thread.srmcfg);
 
 	if (thread_srmcfg != *cpu_srmcfg_ptr) {
+		trace_printk("DEBUG %s(): next task (%d) has thread.srmcfg=0x%x, current cpu has srmcfg=0x%x\n",
+			     __func__,  next->pid, thread_srmcfg, *cpu_srmcfg_ptr);
+
 		*cpu_srmcfg_ptr = thread_srmcfg;
 		csr_write(CSR_SRMCFG, thread_srmcfg);
 	}
