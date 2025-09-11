@@ -19,7 +19,11 @@ static inline void __switch_to_srmcfg(struct task_struct *prev, struct task_stru
 	next_srmcfg = READ_ONCE(next->thread.srmcfg);
 
 	if (next_srmcfg != prev_srmcfg)
+	{
 		csr_write(CSR_SRMCFG, next_srmcfg);
+		trace_printk("DEBUG %s(): prev: task %d prev_srmcfg 0x%x / next:  task %d next_srmcfg 0x%x\n",
+			     __func__,  prev->pid, prev_srmcfg, next->pid, next_srmcfg);
+	}
 }
 
 static __always_inline bool has_srmcfg(void)
