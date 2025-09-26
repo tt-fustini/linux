@@ -150,7 +150,7 @@ void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid, u32 rmid) { }
 
 void resctrl_arch_sched_in(struct task_struct *tsk)
 {
-	qos_sched_in(tsk);
+	__switch_to_srmcfg(tsk);
 }
 
 void resctrl_arch_set_closid_rmid(struct task_struct *tsk, u32 closid, u32 rmid)
