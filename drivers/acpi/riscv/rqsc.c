@@ -91,7 +91,7 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 			 * can access the memory-mapped registers of any CBQRI
 			 * controller in the system.
 			 */
-			err = cpumask_parse("FF", &ctrl_info->cache.cpu_mask);
+			err = acpi_pptt_get_cpumask_from_cache_id(ctrl_info->cache.cache_id, &ctrl_info->cache.cpu_mask);
 			if (err)
 				pr_err("Failed to convert cores mask string to cpumask (%d)", err);
 
