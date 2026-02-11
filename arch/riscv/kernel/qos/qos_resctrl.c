@@ -438,7 +438,7 @@ static int cbqri_apply_cache_config(struct cbqri_resctrl_dom *hw_dom, u32 closid
 		cbqri_set_cbm(ctrl, cfg->cbm);
 
 		/* Capacity config limit operation */
-		err = cbqri_cc_alloc_op(ctrl, CBQRI_CC_ALLOC_CTL_OP_CONFIG_LIMIT, closid, type);
+		err = cbqri_cc_alloc_op(ctrl, CBQRI_CC_ALLOC_CTL_OP_CONFIG_LIMIT, type, closid);
 		if (err < 0) {
 			pr_err("%s(): operation failed: err = %d", __func__, err);
 			return err;
@@ -448,7 +448,7 @@ static int cbqri_apply_cache_config(struct cbqri_resctrl_dom *hw_dom, u32 closid
 		cbqri_set_cbm(ctrl, 0);
 
 		/* Performa capacity read limit operation to verify blockmask */
-		err = cbqri_cc_alloc_op(ctrl, CBQRI_CC_ALLOC_CTL_OP_READ_LIMIT, closid, type);
+		err = cbqri_cc_alloc_op(ctrl, CBQRI_CC_ALLOC_CTL_OP_READ_LIMIT, type, closid);
 		if (err < 0) {
 			pr_err("%s(): operation failed: err = %d", __func__, err);
 			return err;
