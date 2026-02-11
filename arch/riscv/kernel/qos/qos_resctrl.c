@@ -27,6 +27,7 @@ static bool is_cdp_l3_enabled;
 static u32 max_rmid;
 
 LIST_HEAD(cbqri_controllers);
+int cbqri_controllers_size = 0;
 
 static int cbqri_wait_busy_flag(struct cbqri_controller *ctrl, int reg_offset);
 
@@ -97,20 +98,6 @@ struct rdt_resource *resctrl_arch_get_resource(enum resctrl_res_level l)
 		return NULL;
 
 	return &cbqri_resctrl_resources[l].resctrl_res;
-}
-
-struct rdt_domain_hdr *resctrl_arch_find_domain(struct list_head *domain_list, int id)
-{
-	struct rdt_domain_hdr *hdr;
-
-	lockdep_assert_cpus_held();
-
-	list_for_each_entry(hdr, domain_list, list) {
-		if (hdr->id == id)
-			return hdr;
-	}
-
-	return NULL;
 }
 
 bool resctrl_arch_is_evt_configurable(enum resctrl_event_id evt)
@@ -313,13 +300,9 @@ void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
 static void cbqri_set_cbm(struct cbqri_controller *ctrl, u64 cbm)
 {
 	int reg_offset;
-	u64 reg;
 
 	reg_offset = CBQRI_CC_BLOCK_MASK_OFF;
-	reg = ioread64(ctrl->base + reg_offset);
-
-	reg = cbm;
-	iowrite64(reg, ctrl->base + reg_offset);
+	iowrite64(cbm, ctrl->base + reg_offset);
 }
 
 /* Set the Rbwb (reserved bandwidth blocks) field in bc_bw_alloc */
@@ -438,7 +421,7 @@ static int cbqri_apply_cache_config(struct cbqri_resctrl_dom *hw_dom, u32 closid
 		cbqri_set_cbm(ctrl, cfg->cbm);
 
 		/* Capacity config limit operation */
-		err = cbqri_cc_alloc_op(ctrl, CBQRI_CC_ALLOC_CTL_OP_CONFIG_LIMIT, closid, type);
+		err = cbqri_cc_alloc_op(ctrl, CBQRI_CC_ALLOC_CTL_OP_CONFIG_LIMIT, type, closid);
 		if (err < 0) {
 			pr_err("%s(): operation failed: err = %d", __func__, err);
 			return err;
@@ -448,7 +431,7 @@ static int cbqri_apply_cache_config(struct cbqri_resctrl_dom *hw_dom, u32 closid
 		cbqri_set_cbm(ctrl, 0);
 
 		/* Performa capacity read limit operation to verify blockmask */
-		err = cbqri_cc_alloc_op(ctrl, CBQRI_CC_ALLOC_CTL_OP_READ_LIMIT, closid, type);
+		err = cbqri_cc_alloc_op(ctrl, CBQRI_CC_ALLOC_CTL_OP_READ_LIMIT, type, closid);
 		if (err < 0) {
 			pr_err("%s(): operation failed: err = %d", __func__, err);
 			return err;
@@ -737,6 +720,7 @@ static int cbqri_probe_controller(struct cbqri_controller_info *ctrl_info,
 		ctrl_info->rcid_count, ctrl_info->mcid_count);
 
 	/* max_rmid is used by resctrl_arch_system_num_rmid_idx() */
+	// TODO: take the max of all controllers
 	max_rmid = ctrl_info->mcid_count;
 
 	ctrl->ctrl_info = ctrl_info;
@@ -997,7 +981,6 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl, int 
 	struct rdt_ctrl_domain *domain = NULL;
 	struct cbqri_resctrl_res *cbqri_res = NULL;
 	struct rdt_resource *res = NULL;
-	int internal_id = *id;
 	int err = 0;
 
 	domain = qos_new_domain(ctrl);
@@ -1005,6 +988,7 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl, int 
 		return -ENOSPC;
 	if (ctrl->ctrl_info->type == CBQRI_CONTROLLER_TYPE_CAPACITY) {
 		cpumask_copy(&domain->hdr.cpu_mask, &ctrl->ctrl_info->cache.cpu_mask);
+		domain->hdr.id = ctrl->ctrl_info->cache.cache_id;
 		if (ctrl->ctrl_info->cache.cache_level == 2) {
 			cbqri_res = &cbqri_resctrl_resources[RDT_RESOURCE_L2];
 			cbqri_res->max_rcid = ctrl->ctrl_info->rcid_count;
@@ -1046,6 +1030,7 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl, int 
 			goto err_free_domain;
 		}
 	} else if (ctrl->ctrl_info->type == CBQRI_CONTROLLER_TYPE_BANDWIDTH) {
+		domain->hdr.id = ctrl->ctrl_info->mem.prox_dom;
 		if (ctrl->alloc_capable) {
 			cbqri_res = &cbqri_resctrl_resources[RDT_RESOURCE_MBA];
 			cbqri_res->max_rcid = ctrl->ctrl_info->rcid_count;
@@ -1072,15 +1057,13 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl, int 
 		err = -ENODEV;
 		goto err_free_domain;
 	}
-
-	domain->hdr.id = internal_id;
+	pr_err("DEBUG %s(): domain->hdr.id = %d", __func__, domain->hdr.id);
 	err = qos_init_domain_ctrlval(res, domain);
 	if (err)
 		goto err_free_domain;
 
 	if (cbqri_res) {
 		list_add_tail(&domain->hdr.list, &cbqri_res->resctrl_res.ctrl_domains);
-		*id = internal_id;
 		err = resctrl_online_ctrl_domain(res, domain);
 		if (err) {
 			pr_warn("%s(): failed to online cbqri_res domain", __func__);
@@ -1103,23 +1086,20 @@ int qos_resctrl_setup(void)
 	struct cbqri_controller_info *ctrl_info;
 	struct cbqri_controller *ctrl;
 	struct cbqri_resctrl_res *res;
-	static int found_controllers;
 	int err = 0;
 	int id = 0;
-	int i;
+	int i = 0;
+
+        pr_err("DEBUG %s(): cbqri_controllers_size = %d", __func__, cbqri_controllers_size);
 
 	list_for_each_entry(ctrl_info, &cbqri_controllers, list) {
-		err = cbqri_probe_controller(ctrl_info, &controllers[found_controllers]);
+		err = cbqri_probe_controller(ctrl_info, &controllers[i]);
 		if (err) {
 			pr_warn("%s(): failed (%d)", __func__, err);
 			goto err_unmap_controllers;
 		}
 
-		found_controllers++;
-		if (found_controllers > MAX_CONTROLLERS) {
-			pr_warn("%s(): increase MAX_CONTROLLERS value", __func__);
-			break;
-		}
+		i++;
 	}
 
 	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
@@ -1129,7 +1109,8 @@ int qos_resctrl_setup(void)
 		res->resctrl_res.rid = i;
 	}
 
-	for (i = 0; i < found_controllers; i++) {
+        pr_err("DEBUG %s(): cbqri_controllers_size = %d", __func__, cbqri_controllers_size);
+	for (i = 0; i < cbqri_controllers_size; i++) {
 		ctrl = &controllers[i];
 		err = qos_resctrl_add_controller_domain(ctrl, &id);
 		if (err) {
@@ -1170,7 +1151,7 @@ err_free_controllers_list:
 	}
 
 err_unmap_controllers:
-	for (i = 0; i < found_controllers; i++) {
+	for (i = 0; i < cbqri_controllers_size; i++) {
 		iounmap(controllers[i].base);
 		release_mem_region(controllers[i].ctrl_info->addr, controllers[i].ctrl_info->size);
 	}
