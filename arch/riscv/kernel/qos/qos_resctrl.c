@@ -99,20 +99,6 @@ struct rdt_resource *resctrl_arch_get_resource(enum resctrl_res_level l)
 	return &cbqri_resctrl_resources[l].resctrl_res;
 }
 
-struct rdt_domain_hdr *resctrl_arch_find_domain(struct list_head *domain_list, int id)
-{
-	struct rdt_domain_hdr *hdr;
-
-	lockdep_assert_cpus_held();
-
-	list_for_each_entry(hdr, domain_list, list) {
-		if (hdr->id == id)
-			return hdr;
-	}
-
-	return NULL;
-}
-
 bool resctrl_arch_is_evt_configurable(enum resctrl_event_id evt)
 {
 	return false;
