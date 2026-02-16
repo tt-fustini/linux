@@ -299,13 +299,9 @@ void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
 static void cbqri_set_cbm(struct cbqri_controller *ctrl, u64 cbm)
 {
 	int reg_offset;
-	u64 reg;
 
 	reg_offset = CBQRI_CC_BLOCK_MASK_OFF;
-	reg = ioread64(ctrl->base + reg_offset);
-
-	reg = cbm;
-	iowrite64(reg, ctrl->base + reg_offset);
+	iowrite64(cbm, ctrl->base + reg_offset);
 }
 
 /* Set the Rbwb (reserved bandwidth blocks) field in bc_bw_alloc */
