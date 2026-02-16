@@ -719,6 +719,7 @@ static int cbqri_probe_controller(struct cbqri_controller_info *ctrl_info,
 		ctrl_info->rcid_count, ctrl_info->mcid_count);
 
 	/* max_rmid is used by resctrl_arch_system_num_rmid_idx() */
+	// TODO: take the max of all controllers
 	max_rmid = ctrl_info->mcid_count;
 
 	ctrl->ctrl_info = ctrl_info;
