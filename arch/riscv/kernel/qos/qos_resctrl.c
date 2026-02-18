@@ -980,7 +980,6 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl, int 
 	struct rdt_ctrl_domain *domain = NULL;
 	struct cbqri_resctrl_res *cbqri_res = NULL;
 	struct rdt_resource *res = NULL;
-	int internal_id = *id;
 	int err = 0;
 
 	domain = qos_new_domain(ctrl);
@@ -988,6 +987,7 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl, int 
 		return -ENOSPC;
 	if (ctrl->ctrl_info->type == CBQRI_CONTROLLER_TYPE_CAPACITY) {
 		cpumask_copy(&domain->hdr.cpu_mask, &ctrl->ctrl_info->cache.cpu_mask);
+		domain->hdr.id = ctrl->ctrl_info->cache.cache_id;
 		if (ctrl->ctrl_info->cache.cache_level == 2) {
 			cbqri_res = &cbqri_resctrl_resources[RDT_RESOURCE_L2];
 			cbqri_res->max_rcid = ctrl->ctrl_info->rcid_count;
@@ -1029,6 +1029,7 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl, int 
 			goto err_free_domain;
 		}
 	} else if (ctrl->ctrl_info->type == CBQRI_CONTROLLER_TYPE_BANDWIDTH) {
+		domain->hdr.id = ctrl->ctrl_info->mem.prox_dom;
 		if (ctrl->alloc_capable) {
 			cbqri_res = &cbqri_resctrl_resources[RDT_RESOURCE_MBA];
 			cbqri_res->max_rcid = ctrl->ctrl_info->rcid_count;
@@ -1055,15 +1056,13 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl, int 
 		err = -ENODEV;
 		goto err_free_domain;
 	}
-
-	domain->hdr.id = internal_id;
+	pr_err("DEBUG %s(): domain->hdr.id = %d", __func__, domain->hdr.id);
 	err = qos_init_domain_ctrlval(res, domain);
 	if (err)
 		goto err_free_domain;
 
 	if (cbqri_res) {
 		list_add_tail(&domain->hdr.list, &cbqri_res->resctrl_res.ctrl_domains);
-		*id = internal_id;
 		err = resctrl_online_ctrl_domain(res, domain);
 		if (err) {
 			pr_warn("%s(): failed to online cbqri_res domain", __func__);
