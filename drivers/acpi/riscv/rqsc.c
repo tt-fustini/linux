@@ -49,6 +49,9 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 		rqsc = (struct acpi_table_rqsc *)table;
 	}
 
+	pr_err("DEBUG %s(): rqsc->num = %d", __func__, rqsc->num);
+	cbqri_controllers_size = rqsc->num;
+	pr_err("DEBUG %s(): cbqri_controllers_size = %d", __func__, cbqri_controllers_size);
 	for (int i = 0; i < rqsc->num; i++) {
 		struct cbqri_controller_info *ctrl_info;
 
