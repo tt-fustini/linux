@@ -38,6 +38,7 @@ struct cbqri_controller_info {
 };
 
 extern struct list_head cbqri_controllers;
+extern int cbqri_controllers_size;
 
 bool resctrl_arch_alloc_capable(void);
 bool resctrl_arch_mon_capable(void);
