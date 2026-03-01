@@ -1086,25 +1086,20 @@ int qos_resctrl_setup(void)
 	struct cbqri_controller_info *ctrl_info;
 	struct cbqri_controller *ctrl;
 	struct cbqri_resctrl_res *res;
-	static int found_controllers;
 	int err = 0;
 	int id = 0;
-	int i;
+	int i = 0;
 
         pr_err("DEBUG %s(): cbqri_controllers_size = %d", __func__, cbqri_controllers_size);
 
 	list_for_each_entry(ctrl_info, &cbqri_controllers, list) {
-		err = cbqri_probe_controller(ctrl_info, &controllers[found_controllers]);
+		err = cbqri_probe_controller(ctrl_info, &controllers[i]);
 		if (err) {
 			pr_warn("%s(): failed (%d)", __func__, err);
 			goto err_unmap_controllers;
 		}
 
-		found_controllers++;
-		if (found_controllers > MAX_CONTROLLERS) {
-			pr_warn("%s(): increase MAX_CONTROLLERS value", __func__);
-			break;
-		}
+		i++;
 	}
 
 	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
@@ -1114,7 +1109,8 @@ int qos_resctrl_setup(void)
 		res->resctrl_res.rid = i;
 	}
 
-	for (i = 0; i < found_controllers; i++) {
+        pr_err("DEBUG %s(): cbqri_controllers_size = %d", __func__, cbqri_controllers_size);
+	for (i = 0; i < cbqri_controllers_size; i++) {
 		ctrl = &controllers[i];
 		err = qos_resctrl_add_controller_domain(ctrl, &id);
 		if (err) {
@@ -1155,7 +1151,7 @@ err_free_controllers_list:
 	}
 
 err_unmap_controllers:
-	for (i = 0; i < found_controllers; i++) {
+	for (i = 0; i < cbqri_controllers_size; i++) {
 		iounmap(controllers[i].base);
 		release_mem_region(controllers[i].ctrl_info->addr, controllers[i].ctrl_info->size);
 	}
