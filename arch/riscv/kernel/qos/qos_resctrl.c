@@ -27,6 +27,7 @@ static bool is_cdp_l3_enabled;
 static u32 max_rmid;
 
 LIST_HEAD(cbqri_controllers);
+int cbqri_controllers_size = 0;
 
 static int cbqri_wait_busy_flag(struct cbqri_controller *ctrl, int reg_offset);
 
@@ -1089,6 +1090,8 @@ int qos_resctrl_setup(void)
 	int err = 0;
 	int id = 0;
 	int i;
+
+        pr_err("DEBUG %s(): cbqri_controllers_size = %d", __func__, cbqri_controllers_size);
 
 	list_for_each_entry(ctrl_info, &cbqri_controllers, list) {
 		err = cbqri_probe_controller(ctrl_info, &controllers[found_controllers]);
