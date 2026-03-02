@@ -53,60 +53,67 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 	cbqri_controllers_size = rqsc->num;
 	pr_err("DEBUG %s(): cbqri_controllers_size = %d", __func__, cbqri_controllers_size);
 	for (int i = 0; i < rqsc->num; i++) {
+		struct cbqri_controller *ctrl;
 		struct cbqri_controller_info *ctrl_info;
 
 		ctrl_info = kzalloc(sizeof(*ctrl_info), GFP_KERNEL);
 		if (!ctrl_info)
 			return -ENOMEM;
 
-		ctrl_info->type = rqsc->f[i].type;
-		ctrl_info->addr = rqsc->f[i].reg[1];
-		ctrl_info->size = CBQRI_CTRL_SIZE;
-		ctrl_info->rcid_count = rqsc->f[i].rcid;
-		ctrl_info->mcid_count = rqsc->f[i].mcid;
+		ctrl = kzalloc(sizeof(*ctrl), GFP_KERNEL);
+		if (!ctrl)
+			return -ENOMEM;
+
+		ctrl->ctrl_info = ctrl_info;
+
+		ctrl->ctrl_info->type = rqsc->f[i].type;
+		ctrl->ctrl_info->addr = rqsc->f[i].reg[1];
+		ctrl->ctrl_info->size = CBQRI_CTRL_SIZE;
+		ctrl->ctrl_info->rcid_count = rqsc->f[i].rcid;
+		ctrl->ctrl_info->mcid_count = rqsc->f[i].mcid;
 
 		pr_info("Found controller with type %u addr 0x%lx size  %lu rcid  %u mcid  %u",
-			ctrl_info->type, ctrl_info->addr, ctrl_info->size,
-			ctrl_info->rcid_count, ctrl_info->mcid_count);
+			ctrl->ctrl_info->type, ctrl->ctrl_info->addr, ctrl->ctrl_info->size,
+			ctrl->ctrl_info->rcid_count, ctrl->ctrl_info->mcid_count);
 
-		if (ctrl_info->type == CBQRI_CONTROLLER_TYPE_CAPACITY) {
-			ctrl_info->cache.cache_id = rqsc->f[i].res.id1;
-			ctrl_info->cache.cache_level =
-				find_acpi_cache_level_from_id(ctrl_info->cache.cache_id);
+		if (ctrl->ctrl_info->type == CBQRI_CONTROLLER_TYPE_CAPACITY) {
+			ctrl->ctrl_info->cache.cache_id = rqsc->f[i].res.id1;
+			ctrl->ctrl_info->cache.cache_level =
+				find_acpi_cache_level_from_id(ctrl->ctrl_info->cache.cache_id);
 
 			struct acpi_pptt_cache *cache;
 
-			cache = find_acpi_cache_from_id(ctrl_info->cache.cache_id);
+			cache = find_acpi_cache_from_id(ctrl->ctrl_info->cache.cache_id);
 			if (cache) {
-				ctrl_info->cache.cache_size = cache->size;
+				ctrl->ctrl_info->cache.cache_size = cache->size;
 			} else {
 				pr_warn("%s(): failed to determine size for cache id 0x%x",
-					__func__, ctrl_info->cache.cache_id);
-				ctrl_info->cache.cache_size = 0;
+					__func__, ctrl->ctrl_info->cache.cache_id);
+				ctrl->ctrl_info->cache.cache_size = 0;
 			}
 
 			pr_info("Cache controller has ID 0x%x level %u size %u ",
-				ctrl_info->cache.cache_id, ctrl_info->cache.cache_level,
-				ctrl_info->cache.cache_size);
+				ctrl->ctrl_info->cache.cache_id, ctrl->ctrl_info->cache.cache_level,
+				ctrl->ctrl_info->cache.cache_size);
 
 			/*
 			 * For CBQRI, any cpu (technically a hart in RISC-V terms)
 			 * can access the memory-mapped registers of any CBQRI
 			 * controller in the system.
 			 */
-			err = acpi_pptt_get_cpumask_from_cache_id(ctrl_info->cache.cache_id, &ctrl_info->cache.cpu_mask);
+			err = acpi_pptt_get_cpumask_from_cache_id(ctrl->ctrl_info->cache.cache_id, &ctrl->ctrl_info->cache.cpu_mask);
 			if (err)
 				pr_err("Failed to convert cores mask string to cpumask (%d)", err);
 
-		} else if (ctrl_info->type == CBQRI_CONTROLLER_TYPE_BANDWIDTH) {
-			ctrl_info->mem.prox_dom = rqsc->f[i].res.id1;
+		} else if (ctrl->ctrl_info->type == CBQRI_CONTROLLER_TYPE_BANDWIDTH) {
+			ctrl->ctrl_info->mem.prox_dom = rqsc->f[i].res.id1;
 			pr_info("Memory controller with proximity domain %u",
-				ctrl_info->mem.prox_dom);
+				ctrl->ctrl_info->mem.prox_dom);
 		}
 
 		/* Fill the list shared with RISC-V QoS resctrl */
-		INIT_LIST_HEAD(&ctrl_info->list);
-		list_add_tail(&ctrl_info->list, &cbqri_controllers);
+		INIT_LIST_HEAD(&ctrl->ctrl_info->list);
+		list_add_tail(&ctrl->ctrl_info->list, &cbqri_controllers);
 	}
 
 	return 0;
