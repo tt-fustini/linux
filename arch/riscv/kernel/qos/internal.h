@@ -3,6 +3,7 @@
 #define _ASM_RISCV_QOS_INTERNAL_H
 
 #include <linux/resctrl.h>
+#include <linux/riscv_qos.h>
 
 #define CBQRI_CC_CAPABILITIES_OFF 0
 #define CBQRI_CC_MON_CTL_OFF      8
@@ -69,66 +70,6 @@ int qos_resctrl_setup(void);
 void qos_resctrl_exit(void);
 int qos_resctrl_online_cpu(unsigned int cpu);
 int qos_resctrl_offline_cpu(unsigned int cpu);
-
-/* Capacity Controller hardware capabilities */
-struct riscv_cbqri_capacity_caps {
-	u16 ncblks; /* number of capacity blocks */
-	u16 cache_level;
-	u32 blk_size;
-
-	bool supports_alloc_at_data;
-	bool supports_alloc_at_code;
-
-	bool supports_alloc_op_config_limit;
-	bool supports_alloc_op_read_limit;
-	bool supports_alloc_op_flush_rcid;
-
-	bool supports_mon_at_data;
-	bool supports_mon_at_code;
-
-	bool supports_mon_op_config_event;
-	bool supports_mon_op_read_counter;
-
-	bool supports_mon_evt_id_none;
-	bool supports_mon_evt_id_occupancy;
-};
-
-/* Bandwidth Controller hardware capabilities */
-struct riscv_cbqri_bandwidth_caps {
-	u16 nbwblks; /* number of bandwidth blocks */
-	u16 mrbwb;   /* max reserved bw blocks */
-
-	bool supports_alloc_at_data;
-	bool supports_alloc_at_code;
-
-	bool supports_alloc_op_config_limit;
-	bool supports_alloc_op_read_limit;
-
-	bool supports_mon_at_data;
-	bool supports_mon_at_code;
-
-	bool supports_mon_op_config_event;
-	bool supports_mon_op_read_counter;
-
-	bool supports_mon_evt_id_none;
-	bool supports_mon_evt_id_rdwr_count;
-	bool supports_mon_evt_id_rdonly_count;
-	bool supports_mon_evt_id_wronly_count;
-};
-
-struct cbqri_controller {
-	struct cbqri_controller_info *ctrl_info;
-	void __iomem *base;
-
-	int ver_major;
-	int ver_minor;
-
-	struct riscv_cbqri_bandwidth_caps bc;
-	struct riscv_cbqri_capacity_caps cc;
-
-	bool alloc_capable;
-	bool mon_capable;
-};
 
 struct cbqri_resctrl_res {
 	struct rdt_resource     resctrl_res;
