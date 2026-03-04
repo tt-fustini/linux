@@ -3202,61 +3202,6 @@ struct acpi_table_rqsc {
 	struct acpi_table_rqsc_fields f[6]; // this needs to be a list
 };
 
-/* RQSC Flags */
-#define ACPI_RQSC_TIMER_CANNOT_WAKEUP_CPU       (1)
-
-/*
- * RQSC subtables
- */
-struct acpi_rqsc_node_header {
-	u16 type;
-	u16 length;
-	u16 revision;
-};
-
-/* Values for RQSC subtable Type above */
-enum acpi_rqsc_node_type {
-	ACPI_RQSC_NODE_TYPE_ISA_STRING = 0x0000,
-	ACPI_RQSC_NODE_TYPE_CMO = 0x0001,
-	ACPI_RQSC_NODE_TYPE_MMU = 0x0002,
-	ACPI_RQSC_NODE_TYPE_RESERVED = 0x0003,
-	ACPI_RQSC_NODE_TYPE_HART_INFO = 0xFFFF,
-};
-
-/*
- * RQSC node specific subtables
- */
-
-/* ISA string node structure */
-struct acpi_rqsc_isa_string {
-	u16 isa_length;
-	char isa[];
-};
-
-struct acpi_rqsc_cmo_node {
-	u8 reserved;		/* Must be zero */
-	u8 cbom_size;		/* CBOM size in powerof 2 */
-	u8 cbop_size;		/* CBOP size in powerof 2 */
-	u8 cboz_size;		/* CBOZ size in powerof 2 */
-};
-
-struct acpi_rqsc_mmu_node {
-	u8 reserved;		/* Must be zero */
-	u8 mmu_type;		/* Virtual Address Scheme */
-};
-
-enum acpi_rqsc_mmu_type {
-	ACPI_RQSC_MMU_TYPE_SV39 = 0,
-	ACPI_RQSC_MMU_TYPE_SV48 = 1,
-	ACPI__MMU_TYPE_SV57 = 2
-};
-
-/* Hart Info node structure */
-struct acpi_rqsc_hart_info {
-	u16 num_offsets;
-	u32 uid;		/* ACPI processor UID */
-};
-
 /*******************************************************************************
  *
  * RHCT - RISC-V Hart Capabilities Table
