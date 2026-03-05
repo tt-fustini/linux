@@ -33,7 +33,7 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 
 	pr_err("DEBUG rqsc = %px", rqsc);
 	pr_err("DEBUG rqsc->header.length = 0x%x", rqsc->header.length);
-	u64 total_node_size = sizeof(acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields);
+	u64 total_node_size = sizeof(struct acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields);
 	pr_err("DEBUG sizeof(acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields) = 0x%llx", total_node_size);
 	pr_err("DEBUG rqsc + sizeof(acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields) = 0x%llx",
 		(u64)rqsc + total_node_size);
@@ -46,7 +46,7 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 	pr_err("DEBUG node = %px length = 0x%x type = 0x%x", node, node->length, node->type);
 	pr_err("DEBUG node = %px res.length: 0x%x res.type: 0x%x", node, node->res.length, node->res.type);
 	pr_err("DEBUG  end = %px", end);
-	for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, sizeof(acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields))) {
+	for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, sizeof(struct acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields))) {
 	//for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, node->length + node->res.length)) {
 		pr_err("\n");
 		pr_err("DEBUG LOOP node: %px type: 0x%x resv: 0x%x length: 0x%x", 
