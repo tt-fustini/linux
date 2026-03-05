@@ -56,14 +56,22 @@ int acpi_get_riscv_isa(struct acpi_table_header *table, unsigned int cpu, const 
 		rhct = (struct acpi_table_rhct *)table;
 	}
 
+	//pr_err("\n");
+	//pr_err("DEBUG %s(): rhct = %px", __func__, rhct);
+	//pr_err("DEBUG %s(): rhct->header.length = %u", __func__, rhct->header.length);
 	end = ACPI_ADD_PTR(struct acpi_rhct_node_header, rhct, rhct->header.length);
+	//pr_err("DEBUG %s(): end = %px", __func__, end);
+
 
 	for (node = ACPI_ADD_PTR(struct acpi_rhct_node_header, rhct, rhct->node_offset);
 	     node < end;
 	     node = ACPI_ADD_PTR(struct acpi_rhct_node_header, node, node->length)) {
+		//pr_err("DEBUG %s(): node = %px length = %u type = %u", __func__, node, node->length, node->type);
 		if (node->type == ACPI_RHCT_NODE_TYPE_HART_INFO) {
 			hart_info = ACPI_ADD_PTR(struct acpi_rhct_hart_info, node, size_hdr);
+			//pr_err("DEBUG %s(): hart_info = %px size_hdr = %u", __func__, hart_info, size_hdr);
 			hart_info_node_offset = ACPI_ADD_PTR(u32, hart_info, size_hartinfo);
+			//pr_err("DEBUG %s(): hart_info_node_offset = %px size_hartinfo = %u", __func__, hart_info_node_offset, size_hartinfo);
 			if (acpi_cpu_id != hart_info->uid)
 				continue;
 
