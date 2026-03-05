@@ -15,44 +15,51 @@
 
 #define CBQRI_CTRL_SIZE 0x1000
 
-static struct acpi_table_rqsc *acpi_get_rqsc(void)
-{
-	static struct acpi_table_header *rqsc;
-	acpi_status status;
-
-	/*
-	 * RQSC will be used at runtime on every CPU, so we
-	 * don't need to call acpi_put_table() to release the table mapping.
-	 */
-	if (!rqsc) {
-		status = acpi_get_table(ACPI_SIG_RQSC, 0, &rqsc);
-		if (ACPI_FAILURE(status)) {
-			pr_warn_once("No RQSC table found\n");
-			return NULL;
-		}
-	}
-
-	return (struct acpi_table_rqsc *)rqsc;
-}
-
 int acpi_parse_rqsc(struct acpi_table_header *table)
 {
 	struct acpi_table_rqsc *rqsc;
-	int err;
+	struct acpi_table_rqsc_fields *end;
+	struct acpi_table_rqsc_fields *node;
+	//int err;
 
 	BUG_ON(acpi_disabled);
-	if (!table) {
-		rqsc = acpi_get_rqsc();
-		if (!rqsc)
-			return -ENOENT;
-	} else {
-		rqsc = (struct acpi_table_rqsc *)table;
-	}
 
-	pr_err("DEBUG %s(): rqsc->num = %d", __func__, rqsc->num);
+	pr_err("DEBUG sizeof(acpi_table_header)         = 0x%lx", sizeof(struct acpi_table_header));
+	pr_err("DEBUG sizeof(acpi_table_rqsc)           = 0x%lx", sizeof(struct acpi_table_rqsc));
+	pr_err("DEBUG sizeof(acpi_table_rqsc_fields)    = 0x%lx", sizeof(struct acpi_table_rqsc_fields));
+	pr_err("DEBUG sizeof(acpi_table_rqsc_fields_res)= 0x%lx", sizeof(struct acpi_table_rqsc_fields_res));
+
+	rqsc = (struct acpi_table_rqsc *)table;
+
+	pr_err("DEBUG rqsc = %px", rqsc);
+	pr_err("DEBUG rqsc->header.length = 0x%x", rqsc->header.length);
+	u64 total_node_size = sizeof(acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields);
+	pr_err("DEBUG sizeof(acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields) = 0x%llx", total_node_size);
+	pr_err("DEBUG rqsc + sizeof(acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields) = 0x%llx",
+		(u64)rqsc + total_node_size);
+
+        end = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, rqsc, rqsc->header.length);
+
 	cbqri_controllers_size = rqsc->num;
-	pr_err("DEBUG %s(): cbqri_controllers_size = %d", __func__, cbqri_controllers_size);
-	for (int i = 0; i < rqsc->num; i++) {
+
+	node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, rqsc, sizeof(struct acpi_table_rqsc));
+	pr_err("DEBUG node = %px length = 0x%x type = 0x%x", node, node->length, node->type);
+	pr_err("DEBUG node = %px res.length: 0x%x res.type: 0x%x", node, node->res.length, node->res.type);
+	pr_err("DEBUG  end = %px", end);
+	for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, sizeof(acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields))) {
+	//for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, node->length + node->res.length)) {
+		pr_err("\n");
+		pr_err("DEBUG LOOP node: %px type: 0x%x resv: 0x%x length: 0x%x", 
+			node, node->type, node->resv, node->length);
+		pr_err("DEBUG LOOP node: %px reg[0][1][2]: 0x%x 0x%x 0x%x", 
+			node, node->reg[0], node->reg[1], node->reg[2]);
+		pr_err("DEBUG LOOP node: %px rcid: 0x%x mcid: 0x%x flags: 0x%hx nres: 0x%hx", 
+			node, node->rcid, node->mcid, node->flags, node->nres);
+		pr_err("DEBUG LOOP node: %px node.res: type: 0x%x resv: 0x%x length: 0x%x", 
+			node, node->res.type, node->res.resv, node->res.length);
+		pr_err("DEBUG LOOP node: %px node.res: flags: 0x%x resv2: 0x%x",
+			node, node->res.flags, node->res.resv2);
+
 		struct cbqri_controller *ctrl;
 		struct cbqri_controller_info *ctrl_info;
 
@@ -66,6 +73,7 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 
 		ctrl->ctrl_info = ctrl_info;
 
+		/*
 		ctrl->ctrl_info->type = rqsc->f[i].type;
 		ctrl->ctrl_info->addr = rqsc->f[i].reg[1];
 		ctrl->ctrl_info->size = CBQRI_CTRL_SIZE;
@@ -75,7 +83,9 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 		pr_info("Found controller with type %u addr 0x%lx size  %lu rcid  %u mcid  %u",
 			ctrl->ctrl_info->type, ctrl->ctrl_info->addr, ctrl->ctrl_info->size,
 			ctrl->ctrl_info->rcid_count, ctrl->ctrl_info->mcid_count);
+		*/
 
+		/*
 		if (ctrl->ctrl_info->type == CBQRI_CONTROLLER_TYPE_CAPACITY) {
 			ctrl->ctrl_info->cache.cache_id = rqsc->f[i].res.id1;
 			ctrl->ctrl_info->cache.cache_level =
@@ -96,11 +106,11 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 				ctrl->ctrl_info->cache.cache_id, ctrl->ctrl_info->cache.cache_level,
 				ctrl->ctrl_info->cache.cache_size);
 
-			/*
-			 * For CBQRI, any cpu (technically a hart in RISC-V terms)
-			 * can access the memory-mapped registers of any CBQRI
-			 * controller in the system.
-			 */
+			// *
+			// * For CBQRI, any cpu (technically a hart in RISC-V terms)
+			// * can access the memory-mapped registers of any CBQRI
+			// * controller in the system.
+			// * 
 			err = acpi_pptt_get_cpumask_from_cache_id(ctrl->ctrl_info->cache.cache_id, &ctrl->ctrl_info->cache.cpu_mask);
 			if (err)
 				pr_err("Failed to convert cores mask string to cpumask (%d)", err);
@@ -110,6 +120,7 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 			pr_info("Memory controller with proximity domain %u",
 				ctrl->ctrl_info->mem.prox_dom);
 		}
+		*/
 
 		/* Fill the list shared with RISC-V QoS resctrl */
 		INIT_LIST_HEAD(&ctrl->ctrl_info->list);
