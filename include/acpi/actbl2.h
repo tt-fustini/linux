@@ -3173,7 +3173,7 @@ enum acpi_rgrt_image_type {
  *
  ******************************************************************************/
 
-struct acpi_table_rqsc_fields_res {
+struct acpi_table_rqsc_fields_res { // 20 bytes
 	u8 type;	// 1
 	u8 resv;	// 1
 	u16 length;	// 2
@@ -3184,16 +3184,17 @@ struct acpi_table_rqsc_fields_res {
 	u32 id2;	// 4
 };
 
-struct acpi_table_rqsc_fields {
+struct acpi_table_rqsc_fields { 
 	u8 type;	//  1
 	u8 resv;	//  1
 	u16 length;	//  2
 	u32 reg[3];	// 12
-	u32 rcid;	//  4
-	u32 mcid;	//  4
+	u16 rcid;	//  2
+	u16 mcid;	//  2
 	u16 flags;	//  2
 	u16 nres;	//  2
 	struct acpi_table_rqsc_fields_res res; // 20
+
 };
 
 struct acpi_table_rqsc {
