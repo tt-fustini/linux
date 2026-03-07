@@ -20,7 +20,7 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 	struct acpi_table_rqsc *rqsc;
 	struct acpi_table_rqsc_fields *end;
 	struct acpi_table_rqsc_fields *node;
-	//int err;
+	int err;
 
 	BUG_ON(acpi_disabled);
 
@@ -47,33 +47,31 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 	pr_err("DEBUG node = %px length = 0x%x type = 0x%x", node, node->length, node->type);
 	pr_err("DEBUG node = %px res.length: 0x%x res.type: 0x%x", node, node->res.length, node->res.type);
 
-	pr_err("DEBUG %*ph", rqsc->header.length, rqsc);
+	//pr_err("DEBUG %*ph", rqsc->header.length, rqsc);
 
+	/*
 	pr_err("DEBUG LOOP node: %px type: 0x%x resv: 0x%x length: 0x%x", node, node->type, node->resv, node->length);
 	pr_err("DEBUG LOOP node: %px reg[0][1][2]: 0x%x 0x%x 0x%x", node, node->reg[0], node->reg[1], node->reg[2]);
 	pr_err("DEBUG LOOP node: %px rcid: 0x%x mcid: 0x%x flags: 0x%hx nres: 0x%hx", node, node->rcid, node->mcid, node->flags, node->nres);
 	pr_err("DEBUG LOOP node: %px node.res: type: 0x%x resv: 0x%x length: 0x%x", node, node->res.type, node->res.resv, node->res.length);
 	pr_err("DEBUG LOOP node: %px node.res: flags: 0x%x resv2: 0x%x", node, node->res.flags, node->res.resv2);
 	pr_err("DEBUG LOOP node: %px node.res: id_type: 0x%x id1: 0x%llx id2: 0x%x", node, node->res.id_type, node->res.id1, node->res.id2);
-/*
-	node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, 48);
+	*/
 
-	pr_err("DEBUG node = %px length = 0x%x type = 0x%x", node, node->length, node->type);
-	pr_err("DEBUG node = %px res.length: 0x%x res.type: 0x%x", node, node->res.length, node->res.type);
+	//pr_err("DEBUG %*ph", node->length, node);
 
-	pr_err("DEBUG %*ph", node->length, node);
-
+	/*
 	pr_err("DEBUG LOOP node: %px type: 0x%x resv: 0x%x length: 0x%x", node, node->type, node->resv, node->length);
 	pr_err("DEBUG LOOP node: %px reg[0][1][2]: 0x%x 0x%x 0x%x", node, node->reg[0], node->reg[1], node->reg[2]);
 	pr_err("DEBUG LOOP node: %px rcid: 0x%x mcid: 0x%x flags: 0x%hx nres: 0x%hx", node, node->rcid, node->mcid, node->flags, node->nres);
 	pr_err("DEBUG LOOP node: %px node.res: type: 0x%x resv: 0x%x length: 0x%x", node, node->res.type, node->res.resv, node->res.length);
 	pr_err("DEBUG LOOP node: %px node.res: flags: 0x%x resv2: 0x%x", node, node->res.flags, node->res.resv2);
-*/
+	*/
 
 	for (int i = 0; i < rqsc->header.length; i++) {
 		char *base = (char *)rqsc;
 		char *ptr = base + i;
-		//pr_err("DEBUG %d: %px 0x%hx", i, ptr, *ptr);
+		pr_err("DEBUG %d: %px 0x%hx", i, ptr, *ptr);
 	}
 
 	//for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, sizeof(struct acpi_table_rqsc) /*sizeof(struct acpi_table_rqsc_fields)*/)) {
@@ -85,10 +83,12 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 			node, node->reg[0], node->reg[1], node->reg[2]);
 		pr_err("DEBUG LOOP node: %px rcid: 0x%x mcid: 0x%x flags: 0x%hx nres: 0x%hx", 
 			node, node->rcid, node->mcid, node->flags, node->nres);
-		pr_err("DEBUG LOOP node: %px node.res: type: 0x%x resv: 0x%x length: 0x%x", 
+		pr_err("DEBUG LOOP node: %px res: type: 0x%x resv: 0x%x length: 0x%x", 
 			node, node->res.type, node->res.resv, node->res.length);
-		pr_err("DEBUG LOOP node: %px node.res: flags: 0x%x resv2: 0x%x",
+		pr_err("DEBUG LOOP node: %px res: flags: 0x%x resv2: 0x%x",
 			node, node->res.flags, node->res.resv2);
+		pr_err("DEBUG LOOP node: %px res: id_type: 0x%x id1: 0x%llx id2: 0x%x",
+			node, node->res.id_type, node->res.id1, node->res.id2);
 
 		struct cbqri_controller *ctrl;
 		struct cbqri_controller_info *ctrl_info;
@@ -103,21 +103,20 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 
 		ctrl->ctrl_info = ctrl_info;
 
-		/*
-		ctrl->ctrl_info->type = rqsc->f[i].type;
-		ctrl->ctrl_info->addr = rqsc->f[i].reg[1];
+		ctrl->ctrl_info->type = node->type;
+		ctrl->ctrl_info->addr = node->reg[1];
 		ctrl->ctrl_info->size = CBQRI_CTRL_SIZE;
-		ctrl->ctrl_info->rcid_count = rqsc->f[i].rcid;
-		ctrl->ctrl_info->mcid_count = rqsc->f[i].mcid;
+		ctrl->ctrl_info->rcid_count = node->rcid;
+		ctrl->ctrl_info->mcid_count = node->rcid;
 
 	
 		pr_info("Found controller with type %u addr 0x%lx size  %lu rcid  %u mcid  %u",
 			ctrl->ctrl_info->type, ctrl->ctrl_info->addr, ctrl->ctrl_info->size,
 			ctrl->ctrl_info->rcid_count, ctrl->ctrl_info->mcid_count);
 		if (ctrl->ctrl_info->type == CBQRI_CONTROLLER_TYPE_CAPACITY) {
-			ctrl->ctrl_info->cache.cache_id = rqsc->f[i].res.id1;
+			ctrl->ctrl_info->cache.cache_id = node->res.id1;
 			ctrl->ctrl_info->cache.cache_level =
-				find_acp=i_cache_level_from_id(ctrl->ctrl_info->cache.cache_id);
+				find_acpi_cache_level_from_id(ctrl->ctrl_info->cache.cache_id);
 
 			struct acpi_pptt_cache *cache;
 
@@ -144,12 +143,11 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 				pr_err("Failed to convert cores mask string to cpumask (%d)", err);
 
 		} else if (ctrl->ctrl_info->type == CBQRI_CONTROLLER_TYPE_BANDWIDTH) {
-			ctrl->ctrl_info->mem.prox_dom = rqsc->f[i].res.id1;
+			ctrl->ctrl_info->mem.prox_dom = node->res.id1;
 			pr_info("Memory controller with proximity domain %u",
 				ctrl->ctrl_info->mem.prox_dom);
 		}
 
-		*/
 		// Fill the list shared with RISC-V QoS resctrl
 		//INIT_LIST_HEAD(&ctrl->ctrl_info->list);
 		//list_add_tail(&ctrl->ctrl_info->list, &cbqri_controllers);
