@@ -39,15 +39,45 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 		(u64)rqsc + total_node_size);
 
         end = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, rqsc, rqsc->header.length);
+	pr_err("DEBUG  end = %px", end);
 
 	cbqri_controllers_size = rqsc->num;
 
 	node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, rqsc, sizeof(struct acpi_table_rqsc));
 	pr_err("DEBUG node = %px length = 0x%x type = 0x%x", node, node->length, node->type);
 	pr_err("DEBUG node = %px res.length: 0x%x res.type: 0x%x", node, node->res.length, node->res.type);
-	pr_err("DEBUG  end = %px", end);
-	for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, sizeof(struct acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields))) {
-	//for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, node->length + node->res.length)) {
+
+	pr_err("DEBUG %*ph", rqsc->header.length, rqsc);
+
+	pr_err("DEBUG LOOP node: %px type: 0x%x resv: 0x%x length: 0x%x", node, node->type, node->resv, node->length);
+	pr_err("DEBUG LOOP node: %px reg[0][1][2]: 0x%x 0x%x 0x%x", node, node->reg[0], node->reg[1], node->reg[2]);
+	pr_err("DEBUG LOOP node: %px rcid: 0x%x mcid: 0x%x flags: 0x%hx nres: 0x%hx", node, node->rcid, node->mcid, node->flags, node->nres);
+	pr_err("DEBUG LOOP node: %px node.res: type: 0x%x resv: 0x%x length: 0x%x", node, node->res.type, node->res.resv, node->res.length);
+	pr_err("DEBUG LOOP node: %px node.res: flags: 0x%x resv2: 0x%x", node, node->res.flags, node->res.resv2);
+	pr_err("DEBUG LOOP node: %px node.res: id_type: 0x%x id1: 0x%llx id2: 0x%x", node, node->res.id_type, node->res.id1, node->res.id2);
+/*
+	node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, 48);
+
+	pr_err("DEBUG node = %px length = 0x%x type = 0x%x", node, node->length, node->type);
+	pr_err("DEBUG node = %px res.length: 0x%x res.type: 0x%x", node, node->res.length, node->res.type);
+
+	pr_err("DEBUG %*ph", node->length, node);
+
+	pr_err("DEBUG LOOP node: %px type: 0x%x resv: 0x%x length: 0x%x", node, node->type, node->resv, node->length);
+	pr_err("DEBUG LOOP node: %px reg[0][1][2]: 0x%x 0x%x 0x%x", node, node->reg[0], node->reg[1], node->reg[2]);
+	pr_err("DEBUG LOOP node: %px rcid: 0x%x mcid: 0x%x flags: 0x%hx nres: 0x%hx", node, node->rcid, node->mcid, node->flags, node->nres);
+	pr_err("DEBUG LOOP node: %px node.res: type: 0x%x resv: 0x%x length: 0x%x", node, node->res.type, node->res.resv, node->res.length);
+	pr_err("DEBUG LOOP node: %px node.res: flags: 0x%x resv2: 0x%x", node, node->res.flags, node->res.resv2);
+*/
+
+	for (int i = 0; i < rqsc->header.length; i++) {
+		char *base = (char *)rqsc;
+		char *ptr = base + i;
+		//pr_err("DEBUG %d: %px 0x%hx", i, ptr, *ptr);
+	}
+
+	//for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, sizeof(struct acpi_table_rqsc) /*sizeof(struct acpi_table_rqsc_fields)*/)) {
+	for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, 0x30)) {
 		pr_err("\n");
 		pr_err("DEBUG LOOP node: %px type: 0x%x resv: 0x%x length: 0x%x", 
 			node, node->type, node->resv, node->length);
@@ -80,16 +110,14 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 		ctrl->ctrl_info->rcid_count = rqsc->f[i].rcid;
 		ctrl->ctrl_info->mcid_count = rqsc->f[i].mcid;
 
+	
 		pr_info("Found controller with type %u addr 0x%lx size  %lu rcid  %u mcid  %u",
 			ctrl->ctrl_info->type, ctrl->ctrl_info->addr, ctrl->ctrl_info->size,
 			ctrl->ctrl_info->rcid_count, ctrl->ctrl_info->mcid_count);
-		*/
-
-		/*
 		if (ctrl->ctrl_info->type == CBQRI_CONTROLLER_TYPE_CAPACITY) {
 			ctrl->ctrl_info->cache.cache_id = rqsc->f[i].res.id1;
 			ctrl->ctrl_info->cache.cache_level =
-				find_acpi_cache_level_from_id(ctrl->ctrl_info->cache.cache_id);
+				find_acp=i_cache_level_from_id(ctrl->ctrl_info->cache.cache_id);
 
 			struct acpi_pptt_cache *cache;
 
@@ -120,11 +148,11 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 			pr_info("Memory controller with proximity domain %u",
 				ctrl->ctrl_info->mem.prox_dom);
 		}
-		*/
 
-		/* Fill the list shared with RISC-V QoS resctrl */
-		INIT_LIST_HEAD(&ctrl->ctrl_info->list);
-		list_add_tail(&ctrl->ctrl_info->list, &cbqri_controllers);
+		*/
+		// Fill the list shared with RISC-V QoS resctrl
+		//INIT_LIST_HEAD(&ctrl->ctrl_info->list);
+		//list_add_tail(&ctrl->ctrl_info->list, &cbqri_controllers);
 	}
 
 	return 0;
