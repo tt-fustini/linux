@@ -33,10 +33,6 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 
 	pr_err("DEBUG rqsc = %px", rqsc);
 	pr_err("DEBUG rqsc->header.length = 0x%x", rqsc->header.length);
-	u64 total_node_size = sizeof(struct acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields);
-	pr_err("DEBUG sizeof(acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields) = 0x%llx", total_node_size);
-	pr_err("DEBUG rqsc + sizeof(acpi_table_rqsc) + sizeof(struct acpi_table_rqsc_fields) = 0x%llx",
-		(u64)rqsc + total_node_size);
 
         end = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, rqsc, rqsc->header.length);
 	pr_err("DEBUG  end = %px", end);
@@ -45,29 +41,27 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 
 	node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, rqsc, sizeof(struct acpi_table_rqsc));
 	pr_err("DEBUG node = %px length = 0x%x type = 0x%x", node, node->length, node->type);
-	pr_err("DEBUG node = %px res.length: 0x%x res.type: 0x%x", node, node->res.length, node->res.type);
 
-	//pr_err("DEBUG %*ph", rqsc->header.length, rqsc);
-
-	/*
-	pr_err("DEBUG LOOP node: %px type: 0x%x resv: 0x%x length: 0x%x", node, node->type, node->resv, node->length);
+	pr_err("\n");
+	pr_err("DEBUG LOOP node: %px type: 0x%hx resv: 0x%hx length: 0x%hx", node, node->type, node->resv, node->length);
 	pr_err("DEBUG LOOP node: %px reg[0][1][2]: 0x%x 0x%x 0x%x", node, node->reg[0], node->reg[1], node->reg[2]);
-	pr_err("DEBUG LOOP node: %px rcid: 0x%x mcid: 0x%x flags: 0x%hx nres: 0x%hx", node, node->rcid, node->mcid, node->flags, node->nres);
+	pr_err("DEBUG LOOP node: %px rcid: 0x%hx mcid: 0x%hx flags: 0x%hx nres: 0x%hx", node, node->rcid, node->mcid, node->flags, node->nres);
 	pr_err("DEBUG LOOP node: %px node.res: type: 0x%x resv: 0x%x length: 0x%x", node, node->res.type, node->res.resv, node->res.length);
 	pr_err("DEBUG LOOP node: %px node.res: flags: 0x%x resv2: 0x%x", node, node->res.flags, node->res.resv2);
 	pr_err("DEBUG LOOP node: %px node.res: id_type: 0x%x id1: 0x%llx id2: 0x%x", node, node->res.id_type, node->res.id1, node->res.id2);
-	*/
 
-	//pr_err("DEBUG %*ph", node->length, node);
+	node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, node->length + 2);
 
-	/*
-	pr_err("DEBUG LOOP node: %px type: 0x%x resv: 0x%x length: 0x%x", node, node->type, node->resv, node->length);
+	pr_err("\n");
+	pr_err("DEBUG LOOP node: %px type: 0x%hx resv: 0x%hx length: 0x%hx", node, node->type, node->resv, node->length);
 	pr_err("DEBUG LOOP node: %px reg[0][1][2]: 0x%x 0x%x 0x%x", node, node->reg[0], node->reg[1], node->reg[2]);
-	pr_err("DEBUG LOOP node: %px rcid: 0x%x mcid: 0x%x flags: 0x%hx nres: 0x%hx", node, node->rcid, node->mcid, node->flags, node->nres);
+	pr_err("DEBUG LOOP node: %px rcid: 0x%hx mcid: 0x%hx flags: 0x%hx nres: 0x%hx", node, node->rcid, node->mcid, node->flags, node->nres);
 	pr_err("DEBUG LOOP node: %px node.res: type: 0x%x resv: 0x%x length: 0x%x", node, node->res.type, node->res.resv, node->res.length);
 	pr_err("DEBUG LOOP node: %px node.res: flags: 0x%x resv2: 0x%x", node, node->res.flags, node->res.resv2);
-	*/
+	pr_err("DEBUG LOOP node: %px node.res: id_type: 0x%x id1: 0x%llx id2: 0x%x", node, node->res.id_type, node->res.id1, node->res.id2);
 
+	//pr_err("DEBUG %*ph", rqsc->header.length, rqsc);
+	//pr_err("DEBUG %*ph", node->length, node);
 	for (int i = 0; i < rqsc->header.length; i++) {
 		char *base = (char *)rqsc;
 		char *ptr = base + i;
@@ -75,7 +69,8 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 	}
 
 	//for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, sizeof(struct acpi_table_rqsc) /*sizeof(struct acpi_table_rqsc_fields)*/)) {
-	for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, 0x30)) {
+	//for ( ; node < end; node = ACPI_ADD_PTR(struct acpi_table_rqsc_fields, node, 0x30)) {
+	while ( 0 ) {
 		pr_err("\n");
 		pr_err("DEBUG LOOP node: %px type: 0x%x resv: 0x%x length: 0x%x", 
 			node, node->type, node->resv, node->length);
