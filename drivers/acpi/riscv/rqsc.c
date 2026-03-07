@@ -149,8 +149,8 @@ int acpi_parse_rqsc(struct acpi_table_header *table)
 		}
 
 		// Fill the list shared with RISC-V QoS resctrl
-		//INIT_LIST_HEAD(&ctrl->ctrl_info->list);
-		//list_add_tail(&ctrl->ctrl_info->list, &cbqri_controllers);
+		INIT_LIST_HEAD(&ctrl->ctrl_info->list);
+		list_add_tail(&ctrl->ctrl_info->list, &cbqri_controllers);
 	}
 
 	return 0;
