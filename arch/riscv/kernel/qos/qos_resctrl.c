@@ -176,8 +176,10 @@ void resctrl_arch_rmid_idx_decode(u32 idx, u32 *closid, u32 *rmid)
 	*rmid = idx;
 }
 
-/* RISC-V resctrl interface does not maintain a default srmcfg value for a given CPU */
-void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid, u32 rmid) { }
+void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid, u32 rmid) {
+	pr_err("DEBUG %s(): cpu=%d closid=%u rmid=%u", __func__, cpu, closid, rmid);
+
+}
 
 void resctrl_arch_sched_in(struct task_struct *tsk)
 {
@@ -187,6 +189,8 @@ void resctrl_arch_sched_in(struct task_struct *tsk)
 void resctrl_arch_set_closid_rmid(struct task_struct *tsk, u32 closid, u32 rmid)
 {
 	u32 srmcfg;
+
+	pr_err("DEBUG %s(): closid=%u rmid=%u", __func__, closid, rmid);
 
 	WARN_ON_ONCE((closid & SRMCFG_RCID_MASK) != closid);
 	WARN_ON_ONCE((rmid & SRMCFG_MCID_MASK) != rmid);
@@ -200,6 +204,7 @@ void resctrl_arch_sync_cpu_closid_rmid(void *info)
 {
 	struct resctrl_cpu_defaults *r = info;
 
+	pr_err("DEBUG %s(): enter", __func__);
 	lockdep_assert_preemption_disabled();
 
 	if (r) {
