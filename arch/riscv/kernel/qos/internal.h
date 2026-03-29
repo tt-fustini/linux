@@ -73,15 +73,12 @@ int qos_resctrl_offline_cpu(unsigned int cpu);
 
 struct cbqri_resctrl_res {
 	struct rdt_resource     resctrl_res;
-	struct cbqri_controller controller;
 	u32 max_rcid;
 	u32 max_mcid;
 };
 
 struct cbqri_resctrl_dom {
 	struct rdt_ctrl_domain  resctrl_ctrl_dom;
-	u64 cbm;
-	u64 rbwb;
 	struct cbqri_controller *hw_ctrl;
 };
 
