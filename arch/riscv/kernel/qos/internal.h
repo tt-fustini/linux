@@ -3,6 +3,10 @@
 #define _ASM_RISCV_QOS_INTERNAL_H
 
 #include <linux/bitfield.h>
+#include <linux/resctrl.h>
+#include <linux/riscv_qos.h>
+
+#define RISCV_RESCTRL_EMPTY_CLOSID	((u32)~0)
 
 #define CBQRI_CC_CAPABILITIES_OFF 0
 #define CBQRI_CC_MON_CTL_OFF      8
@@ -53,5 +57,25 @@
 #define CBQRI_BC_ALLOC_CTL_OP_CONFIG_LIMIT 1
 #define CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT   2
 #define CBQRI_BC_ALLOC_CTL_STATUS_SUCCESS  1
+
+int qos_resctrl_setup(void);
+int qos_resctrl_online_cpu(unsigned int cpu);
+int qos_resctrl_offline_cpu(unsigned int cpu);
+
+struct cbqri_resctrl_res {
+	struct rdt_resource     resctrl_res;
+	u32 max_rcid;
+	u32 max_mcid;
+};
+
+struct cbqri_resctrl_dom {
+	struct rdt_ctrl_domain  resctrl_ctrl_dom;
+	struct cbqri_controller *hw_ctrl;
+};
+
+struct cbqri_config {
+	u64 cbm; /* capacity block mask */
+	u64 rbwb; /* reserved bandwidth blocks */
+};
 
 #endif /* _ASM_RISCV_QOS_INTERNAL_H */
