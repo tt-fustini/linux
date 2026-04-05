@@ -1086,10 +1086,12 @@ err_unmap_controllers:
 
 int qos_resctrl_online_cpu(unsigned int cpu)
 {
-	return resctrl_online_cpu(cpu);
+	resctrl_online_cpu(cpu);
+	return 0;
 }
 
 int qos_resctrl_offline_cpu(unsigned int cpu)
 {
-	return resctrl_offline_cpu(cpu);
+	resctrl_offline_cpu(cpu);
+	return 0;
 }
