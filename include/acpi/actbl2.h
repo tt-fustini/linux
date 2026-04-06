@@ -55,6 +55,7 @@
 #define ACPI_SIG_RGRT           "RGRT"	/* Regulatory Graphics Resource Table */
 #define ACPI_SIG_RHCT           "RHCT"	/* RISC-V Hart Capabilities Table */
 #define ACPI_SIG_RIMT           "RIMT"	/* RISC-V IO Mapping Table */
+#define ACPI_SIG_RQSC           "RQSC"	/* RISC-V Quality of Service Controller */
 #define ACPI_SIG_SBST           "SBST"	/* Smart Battery Specification Table */
 #define ACPI_SIG_SDEI           "SDEI"	/* Software Delegated Exception Interface Table */
 #define ACPI_SIG_SDEV           "SDEV"	/* Secure Devices table */
@@ -3349,6 +3350,47 @@ enum acpi_rgrt_image_type {
 	ACPI_RGRT_TYPE_RESERVED0 = 0,
 	ACPI_RGRT_IMAGE_TYPE_PNG = 1,
 	ACPI_RGRT_TYPE_RESERVED = 2	/* 2 and greater are reserved */
+};
+
+/*******************************************************************************
+ *
+ * RQSC - RISC-V Quality of Service Controller
+ *        Version 1
+ *
+ ******************************************************************************/
+
+struct acpi_rqsc_resource {
+	u8 type;
+	u8 resv;
+	u16 length;
+	u16 flags;
+	u8 resv2;
+	u8 id_type;
+	u64 id1;
+	u32 id2;
+};
+
+struct acpi_rqsc_node {
+	u8 type;
+	u8 resv;
+	u16 length;
+	/* RQSC v0.9.2 §2 Table 2: 12-byte GAS-format register interface address */
+	struct acpi_generic_address reg;
+	u16 rcid;
+	u16 mcid;
+	u16 flags;
+	u16 nres;
+	/*
+	 * Followed by @nres acpi_rqsc_resource subtables.  Walk them via
+	 * each resource's own length field rather than typed indexing,
+	 * so a future RQSC revision that extends the resource layout
+	 * does not silently misalign offsets in older parsers.
+	 */
+};
+
+struct acpi_table_rqsc {
+	struct acpi_table_header header;	/* Common ACPI table header */
+	u32 num;
 };
 
 /*******************************************************************************
