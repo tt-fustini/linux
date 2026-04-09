@@ -859,3 +859,237 @@ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_ctrl_domain *d,
 	spin_unlock(&ctrl->lock);
 	return val;
 }
+
+static struct rdt_ctrl_domain *qos_new_domain(struct cbqri_controller *ctrl)
+{
+	struct cbqri_resctrl_dom *hw_dom;
+	struct rdt_ctrl_domain *domain;
+
+	hw_dom = kzalloc_obj(*hw_dom, GFP_KERNEL);
+	if (!hw_dom)
+		return NULL;
+
+	/* associate this cbqri_controller with the domain */
+	hw_dom->hw_ctrl = ctrl;
+
+	/* the rdt_domain struct from inside the cbqri_resctrl_dom struct */
+	domain = &hw_dom->resctrl_ctrl_dom;
+
+	INIT_LIST_HEAD(&domain->hdr.list);
+
+	return domain;
+}
+
+static int qos_init_domain_ctrlval(struct rdt_resource *r, struct rdt_ctrl_domain *d)
+{
+	struct cbqri_resctrl_res *hw_res;
+	int err = 0;
+	int i;
+
+	hw_res = container_of(r, struct cbqri_resctrl_res, resctrl_res);
+
+	for (i = 0; i < hw_res->max_rcid; i++) {
+		err = resctrl_arch_update_one(r, d, i, 0, resctrl_get_default_ctrl(r));
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+static void qos_init_cache_resource(struct cbqri_controller *ctrl,
+				    struct cbqri_resctrl_res *cbqri_res,
+				    enum resctrl_res_level rid, char *name,
+				    enum resctrl_scope scope)
+{
+	struct rdt_resource *res = &cbqri_res->resctrl_res;
+
+	cbqri_res->max_rcid = ctrl->rcid_count;
+	cbqri_res->max_mcid = ctrl->mcid_count;
+	res->mon.num_rmid = ctrl->mcid_count;
+	res->rid = rid;
+	res->name = name;
+	res->alloc_capable = ctrl->alloc_capable;
+	res->mon_capable = ctrl->mon_capable;
+	res->schema_fmt = RESCTRL_SCHEMA_BITMAP;
+	res->ctrl_scope = scope;
+	res->cache.cbm_len = ctrl->cc.ncblks;
+	res->cache.shareable_bits = resctrl_get_default_ctrl(res);
+	res->cache.min_cbm_bits = 1;
+}
+
+static void qos_init_membw_resource(struct cbqri_controller *ctrl,
+				     struct cbqri_resctrl_res *cbqri_res)
+{
+	struct rdt_resource *res = &cbqri_res->resctrl_res;
+
+	cbqri_res->max_rcid = ctrl->rcid_count;
+	cbqri_res->max_mcid = ctrl->mcid_count;
+	res->mon.num_rmid = ctrl->mcid_count;
+	res->rid = RDT_RESOURCE_MBA;
+	res->name = "MB";
+	res->alloc_capable = ctrl->alloc_capable;
+	res->schema_fmt = RESCTRL_SCHEMA_RANGE;
+	res->ctrl_scope = RESCTRL_L3_CACHE;
+	res->membw.delay_linear = true;
+	res->membw.arch_needs_linear = true;
+	res->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
+	res->membw.min_bw = 1;
+	res->membw.max_bw = 80;
+	res->membw.bw_gran = 1;
+}
+
+static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl)
+{
+	struct rdt_ctrl_domain *domain;
+	struct cbqri_resctrl_res *cbqri_res = NULL;
+	struct rdt_resource *res = NULL;
+	struct list_head *pos = NULL;
+	int err;
+
+	domain = qos_new_domain(ctrl);
+	if (!domain)
+		return -ENOSPC;
+
+	switch (ctrl->type) {
+	case CBQRI_CONTROLLER_TYPE_CAPACITY:
+		cpumask_copy(&domain->hdr.cpu_mask, &ctrl->cache.cpu_mask);
+		domain->hdr.id = ctrl->cache.cache_id;
+
+		if (ctrl->cache.cache_level == 2) {
+			cbqri_res = &cbqri_resctrl_resources[RDT_RESOURCE_L2];
+			qos_init_cache_resource(ctrl, cbqri_res, RDT_RESOURCE_L2,
+						"L2", RESCTRL_L2_CACHE);
+		} else if (ctrl->cache.cache_level == 3) {
+			cbqri_res = &cbqri_resctrl_resources[RDT_RESOURCE_L3];
+			qos_init_cache_resource(ctrl, cbqri_res, RDT_RESOURCE_L3,
+						"L3", RESCTRL_L3_CACHE);
+		} else {
+			pr_err("unknown cache level %d\n", ctrl->cache.cache_level);
+			err = -ENODEV;
+			goto err_free_domain;
+		}
+		res = &cbqri_res->resctrl_res;
+		break;
+
+	case CBQRI_CONTROLLER_TYPE_BANDWIDTH:
+		domain->hdr.id = ctrl->mem.prox_dom;
+		if (ctrl->alloc_capable) {
+			cbqri_res = &cbqri_resctrl_resources[RDT_RESOURCE_MBA];
+			qos_init_membw_resource(ctrl, cbqri_res);
+			res = &cbqri_res->resctrl_res;
+		}
+		break;
+
+	default:
+		pr_err("unknown controller type %d\n", ctrl->type);
+		err = -ENODEV;
+		goto err_free_domain;
+	}
+
+	if (!res)
+		goto out;
+
+	err = qos_init_domain_ctrlval(res, domain);
+	if (err)
+		goto err_free_domain;
+
+	resctrl_find_domain(&res->ctrl_domains, domain->hdr.id, &pos);
+	if (pos)
+		list_add_tail(&domain->hdr.list, pos);
+	else
+		list_add_tail(&domain->hdr.list, &res->ctrl_domains);
+
+	err = resctrl_online_ctrl_domain(res, domain);
+	if (err) {
+		pr_err("failed to online domain %d\n", domain->hdr.id);
+		goto err_free_domain;
+	}
+
+out:
+	return 0;
+
+err_free_domain:
+	kfree(container_of(domain, struct cbqri_resctrl_dom, resctrl_ctrl_dom));
+	return err;
+}
+
+int qos_resctrl_setup(void)
+{
+	struct rdt_ctrl_domain *domain, *domain_temp;
+	struct cbqri_controller *ctrl;
+	struct cbqri_resctrl_res *res;
+	int err = 0;
+	int i = 0;
+
+	max_rmid = 0;
+
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		res = &cbqri_resctrl_resources[i];
+		INIT_LIST_HEAD(&res->resctrl_res.ctrl_domains);
+		INIT_LIST_HEAD(&res->resctrl_res.mon_domains);
+		res->resctrl_res.rid = i;
+	}
+
+	list_for_each_entry(ctrl, &cbqri_controllers, list) {
+		err = cbqri_probe_controller(ctrl);
+		if (err) {
+			pr_err("%s(): failed (%d)", __func__, err);
+			goto err_unmap_controllers;
+		}
+
+		err = qos_resctrl_add_controller_domain(ctrl);
+		if (err) {
+			pr_err("%s(): failed to add controller domain (%d)", __func__, err);
+			goto err_free_controllers_list;
+		}
+
+		/*
+		 * CDP (code data prioritization) on x86 is similar to
+		 * the AT (access type) field in CBQRI. CDP only supports
+		 * caches so this must be a CBQRI capacity controller.
+		 */
+		if (ctrl->type == CBQRI_CONTROLLER_TYPE_CAPACITY &&
+		    ctrl->cc.supports_alloc_at_code &&
+		    ctrl->cc.supports_alloc_at_data) {
+			if (ctrl->cache.cache_level == 2)
+				exposed_cdp_l2_capable = true;
+			else
+				exposed_cdp_l3_capable = true;
+		}
+	}
+	pr_debug("alloc=%d mon=%d cdp_l2=%d cdp_l3=%d",
+		 exposed_alloc_capable, exposed_mon_capable,
+		 exposed_cdp_l2_capable, exposed_cdp_l3_capable);
+
+	return resctrl_init();
+
+err_free_controllers_list:
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		res = &cbqri_resctrl_resources[i];
+		list_for_each_entry_safe(domain, domain_temp, &res->resctrl_res.ctrl_domains,
+					 hdr.list) {
+			kfree(domain);
+		}
+	}
+
+err_unmap_controllers:
+	list_for_each_entry(ctrl, &cbqri_controllers, list) {
+		if (!ctrl->base)
+			break;
+		iounmap(ctrl->base);
+		ctrl->base = NULL;
+		release_mem_region(ctrl->addr, ctrl->size);
+	}
+
+	return err;
+}
+
+int qos_resctrl_online_cpu(unsigned int cpu)
+{
+	return resctrl_online_cpu(cpu);
+}
+
+int qos_resctrl_offline_cpu(unsigned int cpu)
+{
+	return resctrl_offline_cpu(cpu);
+}
