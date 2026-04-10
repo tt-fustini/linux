@@ -597,7 +597,10 @@ config RISCV_ISA_SVNAPOT
 
 config RISCV_ISA_SSQOSID
 	bool "Ssqosid extension support for supervisor mode Quality of Service ID"
+	depends on MISC_FILESYSTEMS
 	default n
+	select ARCH_HAS_CPU_RESCTRL
+	select RESCTRL_FS
 	help
 	  Adds support for the Ssqosid ISA extension (Supervisor-mode
 	  Quality of Service ID).
