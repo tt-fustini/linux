@@ -2,6 +2,7 @@
 
 #define pr_fmt(fmt) "qos: resctrl: " fmt
 
+#include <linux/cpu.h>
 #include <linux/err.h>
 #include <linux/io.h>
 #include <linux/io-64-nonatomic-lo-hi.h>
@@ -530,4 +531,488 @@ err_iounmap:
 err_release:
 	release_mem_region(ctrl->addr, ctrl->size);
 	return err;
+}
+
+bool resctrl_arch_alloc_capable(void)
+{
+	return exposed_alloc_capable;
+}
+
+bool resctrl_arch_mon_capable(void)
+{
+	return exposed_mon_capable;
+}
+
+bool resctrl_arch_get_cdp_enabled(enum resctrl_res_level rid)
+{
+	switch (rid) {
+	case RDT_RESOURCE_L2:
+		return is_cdp_l2_enabled;
+
+	case RDT_RESOURCE_L3:
+		return is_cdp_l3_enabled;
+
+	default:
+		return false;
+	}
+}
+
+int resctrl_arch_set_cdp_enabled(enum resctrl_res_level rid, bool enable)
+{
+	switch (rid) {
+	case RDT_RESOURCE_L2:
+		if (!exposed_cdp_l2_capable)
+			return -ENODEV;
+		is_cdp_l2_enabled = enable;
+		break;
+
+	case RDT_RESOURCE_L3:
+		if (!exposed_cdp_l3_capable)
+			return -ENODEV;
+		is_cdp_l3_enabled = enable;
+		break;
+
+	default:
+		return -ENODEV;
+	}
+
+	return 0;
+}
+
+struct rdt_resource *resctrl_arch_get_resource(enum resctrl_res_level l)
+{
+	if (l >= RDT_NUM_RESOURCES)
+		return NULL;
+
+	return &cbqri_resctrl_resources[l].resctrl_res;
+}
+
+bool resctrl_arch_is_evt_configurable(enum resctrl_event_id evt)
+{
+	return false;
+}
+
+void *resctrl_arch_mon_ctx_alloc(struct rdt_resource *r,
+				 enum resctrl_event_id evtid)
+{
+	/* RISC-V can always read an rmid, nothing needs allocating */
+	return NULL;
+}
+
+void resctrl_arch_mon_ctx_free(struct rdt_resource *r,
+			       enum resctrl_event_id evtid, void *arch_mon_ctx)
+{
+	/* No arch-private monitoring context to free */
+}
+
+void resctrl_arch_config_cntr(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
+			      enum resctrl_event_id evtid, u32 rmid, u32 closid,
+			      u32 cntr_id, bool assign)
+{
+	/* MBM counter assignment not supported */
+}
+
+int resctrl_arch_cntr_read(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
+			   u32 unused, u32 rmid, int cntr_id,
+			   enum resctrl_event_id eventid, u64 *val)
+{
+	/* MBM counter assignment not supported */
+	return -EOPNOTSUPP;
+}
+
+bool resctrl_arch_mbm_cntr_assign_enabled(struct rdt_resource *r)
+{
+	/* MBM counter assignment not supported */
+	return false;
+}
+
+int resctrl_arch_mbm_cntr_assign_set(struct rdt_resource *r, bool enable)
+{
+	/* MBM counter assignment not supported */
+	return 0;
+}
+
+void resctrl_arch_reset_cntr(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
+			     u32 unused, u32 rmid, int cntr_id,
+			     enum resctrl_event_id eventid)
+{
+	/* MBM counter assignment not supported */
+}
+
+bool resctrl_arch_get_io_alloc_enabled(struct rdt_resource *r)
+{
+	/* CBQRI does not have I/O-specific allocation */
+	return false;
+}
+
+int resctrl_arch_io_alloc_enable(struct rdt_resource *r, bool enable)
+{
+	/* CBQRI does not have I/O-specific allocation */
+	return 0;
+}
+
+/*
+ * Note about terminology between x86 (Intel RDT/AMD QoS) and RISC-V:
+ *   CLOSID on x86 is RCID on RISC-V
+ *     RMID on x86 is MCID on RISC-V
+ */
+u32 resctrl_arch_get_num_closid(struct rdt_resource *res)
+{
+	struct cbqri_resctrl_res *hw_res;
+
+	hw_res = container_of(res, struct cbqri_resctrl_res, resctrl_res);
+
+	return hw_res->max_rcid;
+}
+
+u32 resctrl_arch_system_num_rmid_idx(void)
+{
+	return max_rmid;
+}
+
+u32 resctrl_arch_rmid_idx_encode(u32 closid, u32 rmid)
+{
+	return rmid;
+}
+
+void resctrl_arch_rmid_idx_decode(u32 idx, u32 *closid, u32 *rmid)
+{
+	*closid = RISCV_RESCTRL_EMPTY_CLOSID;
+	*rmid = idx;
+}
+
+void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid, u32 rmid)
+{
+	u32 srmcfg;
+
+	WARN_ON_ONCE((closid & SRMCFG_RCID_MASK) != closid);
+	WARN_ON_ONCE((rmid & SRMCFG_MCID_MASK) != rmid);
+
+	srmcfg = rmid << SRMCFG_MCID_SHIFT;
+	srmcfg |= closid;
+	WRITE_ONCE(per_cpu(cpu_srmcfg_default, cpu), srmcfg);
+}
+
+void resctrl_arch_sched_in(struct task_struct *tsk)
+{
+	__switch_to_srmcfg(tsk);
+}
+
+void resctrl_arch_set_closid_rmid(struct task_struct *tsk, u32 closid, u32 rmid)
+{
+	u32 srmcfg;
+
+	WARN_ON_ONCE((closid & SRMCFG_RCID_MASK) != closid);
+	WARN_ON_ONCE((rmid & SRMCFG_MCID_MASK) != rmid);
+
+	srmcfg = rmid << SRMCFG_MCID_SHIFT;
+	srmcfg |= closid;
+	WRITE_ONCE(tsk->thread.srmcfg, srmcfg);
+}
+
+void resctrl_arch_sync_cpu_closid_rmid(void *info)
+{
+	struct resctrl_cpu_defaults *r = info;
+
+	lockdep_assert_preemption_disabled();
+
+	if (r) {
+		resctrl_arch_set_cpu_default_closid_rmid(smp_processor_id(),
+							 r->closid, r->rmid);
+	}
+
+	resctrl_arch_sched_in(current);
+}
+
+bool resctrl_arch_match_closid(struct task_struct *tsk, u32 closid)
+{
+	return (READ_ONCE(tsk->thread.srmcfg) & SRMCFG_RCID_MASK) == closid;
+}
+
+bool resctrl_arch_match_rmid(struct task_struct *tsk, u32 closid, u32 rmid)
+{
+	u32 tsk_rmid;
+
+	tsk_rmid = READ_ONCE(tsk->thread.srmcfg);
+	tsk_rmid >>= SRMCFG_MCID_SHIFT;
+	tsk_rmid &= SRMCFG_MCID_MASK;
+
+	return tsk_rmid == rmid;
+}
+
+int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
+			   u32 closid, u32 rmid, enum resctrl_event_id eventid,
+			   void *arch_priv, u64 *val, void *arch_mon_ctx)
+{
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	struct rdt_ctrl_domain *d;
+	u64 ctr_val;
+	int err;
+
+	if (eventid != QOS_L3_OCCUP_EVENT_ID)
+		return -EINVAL;
+
+	/*
+	 * The monitoring domain shares the same id as the control domain.
+	 * Find the control domain to get the hw_ctrl pointer.
+	 */
+	d = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+							  hdr->id, NULL);
+	if (!d)
+		return -ENOENT;
+
+	hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+	ctrl = hw_dom->hw_ctrl;
+
+	spin_lock(&ctrl->lock);
+
+	/*
+	 * All MCIDs are configured with the Occupancy event at init time
+	 * (qos_init_mon_counters). Just snapshot the current value.
+	 */
+	err = cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_READ_COUNTER,
+			      rmid, 0, NULL);
+	if (err)
+		goto out;
+
+	ctr_val = ioread64(ctrl->base + CBQRI_CC_MON_CTL_VAL_OFF);
+
+	/* Convert from capacity blocks to bytes */
+	*val = ctr_val * (ctrl->cache.cache_size / ctrl->cc.ncblks);
+
+out:
+	spin_unlock(&ctrl->lock);
+	return err;
+}
+
+void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
+			     u32 closid, u32 rmid, enum resctrl_event_id eventid)
+{
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	struct rdt_ctrl_domain *cd;
+
+	if (eventid != QOS_L3_OCCUP_EVENT_ID)
+		return;
+
+	cd = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+							   d->hdr.id, NULL);
+	if (!cd)
+		return;
+
+	hw_dom = container_of(cd, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+	ctrl = hw_dom->hw_ctrl;
+
+	spin_lock(&ctrl->lock);
+	/* CONFIG_EVENT with EVT_ID=None stops counting and resets counter */
+	cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
+			rmid, CBQRI_CC_EVT_ID_NONE, NULL);
+	spin_unlock(&ctrl->lock);
+}
+
+void resctrl_arch_mon_event_config_read(void *info)
+{
+	/* Event config not supported */
+}
+
+void resctrl_arch_mon_event_config_write(void *info)
+{
+	/* Event config not supported */
+}
+
+void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_l3_mon_domain *d)
+{
+	struct cbqri_resctrl_res *hw_res;
+	int i;
+
+	hw_res = container_of(r, struct cbqri_resctrl_res, resctrl_res);
+
+	for (i = 0; i < hw_res->max_mcid; i++)
+		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_OCCUP_EVENT_ID);
+}
+
+void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
+{
+	struct cbqri_resctrl_res *hw_res;
+	struct cbqri_resctrl_dom *dom;
+	struct rdt_ctrl_domain *d;
+	enum resctrl_conf_type t;
+	struct cbqri_config cfg;
+	u32 default_ctrl;
+	int i;
+
+	lockdep_assert_cpus_held();
+
+	hw_res = container_of(r, struct cbqri_resctrl_res, resctrl_res);
+	default_ctrl = resctrl_get_default_ctrl(r);
+
+	list_for_each_entry(d, &r->ctrl_domains, hdr.list) {
+		dom = container_of(d, struct cbqri_resctrl_dom,
+				   resctrl_ctrl_dom);
+		switch (r->rid) {
+		case RDT_RESOURCE_RBWB:
+			/*
+			 * CBQRI §4.5: Rbwb >= 1, sum(Rbwb) <= MRBWB.
+			 * Give RCID 0 the remaining budget after
+			 * reserving 1 block for every other RCID.
+			 */
+			for (i = 0; i < hw_res->max_rcid; i++) {
+				cfg.rbwb = i == 0 ?
+					dom->hw_ctrl->bc.mrbwb - (hw_res->max_rcid - 1) : 1;
+				cbqri_apply_bw_config(dom, i, 0, &cfg);
+			}
+			break;
+		case RDT_RESOURCE_MWEIGHT:
+			/* Default Mweight = 1 for work-conserving behavior */
+			for (i = 0; i < hw_res->max_rcid; i++) {
+				cfg.mweight = 1;
+				cbqri_apply_mweight_config(dom, i, &cfg);
+			}
+			break;
+		default:
+			for (i = 0; i < hw_res->max_rcid; i++) {
+				for (t = 0; t < CDP_NUM_TYPES; t++)
+					resctrl_arch_update_one(r, d, i, t,
+								default_ctrl);
+			}
+			break;
+		}
+	}
+}
+
+void resctrl_arch_pre_mount(void)
+{
+	/* All controllers discovered at boot via late_initcall; nothing to do */
+}
+
+int resctrl_arch_update_one(struct rdt_resource *r, struct rdt_ctrl_domain *d,
+			    u32 closid, enum resctrl_conf_type t, u32 cfg_val)
+{
+	struct cbqri_resctrl_res *hw_res;
+	struct cbqri_controller *ctrl;
+	struct cbqri_resctrl_dom *dom;
+	struct cbqri_config cfg;
+	u64 sum_other;
+	int err = 0;
+
+	dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+	ctrl = dom->hw_ctrl;
+
+	if (!r->alloc_capable)
+		return -EINVAL;
+
+	switch (r->rid) {
+	case RDT_RESOURCE_L2:
+	case RDT_RESOURCE_L3:
+		cfg.cbm = cfg_val;
+		err = cbqri_apply_cache_config(dom, closid, t, &cfg);
+		break;
+	case RDT_RESOURCE_RBWB:
+		hw_res = container_of(r, struct cbqri_resctrl_res, resctrl_res);
+		sum_other = cbqri_sum_other_rbwb(ctrl, closid, hw_res->max_rcid);
+		if (sum_other + cfg_val > ctrl->bc.mrbwb) {
+			pr_err("%s(): RBWB sum %llu exceeds MRBWB %u\n",
+			       __func__, sum_other + cfg_val, ctrl->bc.mrbwb);
+			return -ENOSPC;
+		}
+		cfg.rbwb = cfg_val;
+		err = cbqri_apply_bw_config(dom, closid, t, &cfg);
+		break;
+	case RDT_RESOURCE_MWEIGHT:
+		cfg.mweight = cfg_val;
+		err = cbqri_apply_mweight_config(dom, closid, &cfg);
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return err;
+}
+
+int resctrl_arch_update_domains(struct rdt_resource *r, u32 closid)
+{
+	struct resctrl_staged_config *cfg;
+	enum resctrl_conf_type t;
+	struct rdt_ctrl_domain *d;
+	int err = 0;
+
+	/* Walking r->ctrl_domains, ensure it can't race with cpuhp */
+	lockdep_assert_cpus_held();
+
+	list_for_each_entry(d, &r->ctrl_domains, hdr.list) {
+		for (t = 0; t < CDP_NUM_TYPES; t++) {
+			cfg = &d->staged_config[t];
+			if (!cfg->have_new_ctrl)
+				continue;
+			err = resctrl_arch_update_one(r, d, closid, t, cfg->new_ctrl);
+			if (err) {
+				pr_err("%s(): update failed (err=%d)\n", __func__, err);
+				return err;
+			}
+		}
+	}
+	return err;
+}
+
+u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_ctrl_domain *d,
+			    u32 closid, enum resctrl_conf_type type)
+{
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	u32 val;
+	int err;
+
+	hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+
+	ctrl = hw_dom->hw_ctrl;
+
+	val = resctrl_get_default_ctrl(r);
+
+	if (!r->alloc_capable)
+		return val;
+
+	spin_lock(&ctrl->lock);
+
+	switch (r->rid) {
+	case RDT_RESOURCE_L2:
+	case RDT_RESOURCE_L3:
+		/* Clear cc_block_mask before read limit operation */
+		cbqri_set_cbm(ctrl, 0);
+
+		/* Capacity read limit operation for RCID (closid) */
+		err = cbqri_cc_alloc_op(ctrl, CBQRI_CC_ALLOC_CTL_OP_READ_LIMIT, closid, type);
+		if (err < 0) {
+			pr_err("%s(): operation failed: err = %d\n", __func__, err);
+			break;
+		}
+
+		/* Read capacity block mask for RCID (closid) */
+		val = ioread64(ctrl->base + CBQRI_CC_BLOCK_MASK_OFF);
+		break;
+
+	case RDT_RESOURCE_RBWB:
+		err = cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT, closid);
+		if (err < 0) {
+			pr_err("%s(): operation failed: err = %d\n", __func__, err);
+			break;
+		}
+		val = cbqri_get_rbwb(ctrl);
+		break;
+
+	case RDT_RESOURCE_MWEIGHT:
+		err = cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT, closid);
+		if (err < 0) {
+			pr_err("%s(): operation failed: err = %d\n", __func__, err);
+			break;
+		}
+		val = cbqri_get_mweight(ctrl);
+		break;
+
+	default:
+		break;
+	}
+
+	spin_unlock(&ctrl->lock);
+	return val;
 }
