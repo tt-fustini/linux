@@ -79,6 +79,7 @@
 #define CBQRI_BC_MON_CTR_VAL_OVF         BIT_ULL(63)
 
 int qos_resctrl_setup(void);
+void qos_resctrl_teardown(void);
 int qos_resctrl_online_cpu(unsigned int cpu);
 int qos_resctrl_offline_cpu(unsigned int cpu);
 

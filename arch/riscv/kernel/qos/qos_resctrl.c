@@ -1761,12 +1761,19 @@ err_ctrl:
 	return err;
 }
 
+/* Set after resctrl_init() succeeds; gates resctrl_exit() in teardown. */
+static bool qos_resctrl_inited;
+
 /*
  * Free every per-resource ctrl_domain and mon_domain registered through
- * qos_resctrl_setup(), then unmap the MMIO regions claimed by each
- * cbqri_controller in cbqri_probe_controller().  Safe to call partway
- * through setup: each list walk is empty if its corresponding pass
- * never ran, and a controller without ->base is skipped.
+ * qos_resctrl_setup(), then -- if resctrl_init() was reached -- tear
+ * down the resctrl FS state, then unmap the MMIO regions claimed by
+ * each cbqri_controller in cbqri_probe_controller().  Safe to call
+ * partway through setup: each list walk is empty if its corresponding
+ * pass never ran, and a controller without ->base is skipped.  Order
+ * matters: resctrl_offline_*_domain() must run before resctrl_exit()
+ * so the latter does not WARN about online domains, and ioremaps must
+ * stay live until both are done.
  */
 void qos_resctrl_teardown(void)
 {
@@ -1793,9 +1800,12 @@ void qos_resctrl_teardown(void)
 		}
 	}
 
+	if (qos_resctrl_inited) {
+		resctrl_exit();
+		qos_resctrl_inited = false;
+	}
+
 	list_for_each_entry(ctrl, &cbqri_controllers, list) {
-		kfree(ctrl->mbm_total_states);
-		ctrl->mbm_total_states = NULL;
 		if (!ctrl->base)
 			continue;
 		iounmap(ctrl->base);
@@ -1882,6 +1892,7 @@ int qos_resctrl_setup(void)
 	err = resctrl_init();
 	if (err)
 		goto err_free_controllers_list;
+	qos_resctrl_inited = true;
 
 	return 0;
 
@@ -1890,14 +1901,118 @@ err_free_controllers_list:
 	return err;
 }
 
+/*
+ * Serialises domain->hdr.cpu_mask mutations from the hotplug path
+ * against any other writer.  Mirrors x86's domain_list_lock pattern
+ * (arch/x86/kernel/cpu/resctrl/core.c) -- cpu_hotplug_lock already
+ * serialises hotplug events themselves, but holding our own mutex
+ * documents the cpu_mask update as a coordinated section.
+ */
+static DEFINE_MUTEX(qos_domain_list_lock);
+
+/*
+ * Track @cpu in every CBQRI domain whose owning controller's PPTT/RQSC
+ * cpumask covers it.  Without this, an offline CPU stays set in
+ * domain->hdr.cpu_mask and resctrl helpers like cpumask_any_housekeeping()
+ * can pick it for the MBM overflow worker.
+ *
+ * Mirrors x86's domain_add/remove_cpu(): the cbqri_controller cpu_mask is
+ * the boot-time PPTT/RQSC ground truth, while domain->hdr.cpu_mask
+ * tracks the *online* subset.
+ *
+ * Empty domains are intentionally not unregistered when the last CPU
+ * goes offline; matches MPAM and avoids a teardown race against the
+ * core's ongoing overflow work.
+ *
+ * Caller must hold qos_domain_list_lock.
+ */
+static void qos_domain_update_cpu(unsigned int cpu, bool online)
+{
+	struct cbqri_resctrl_res *cr;
+	struct cbqri_resctrl_dom *hw_dom;
+	struct rdt_ctrl_domain *cdom;
+	struct rdt_l3_mon_domain *mdom;
+	int i;
+
+	lockdep_assert_held(&qos_domain_list_lock);
+
+	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		cr = &cbqri_resctrl_resources[i];
+
+		list_for_each_entry(cdom, &cr->resctrl_res.ctrl_domains, hdr.list) {
+			const struct cpumask *src;
+
+			hw_dom = container_of(cdom, struct cbqri_resctrl_dom,
+					      resctrl_ctrl_dom);
+			if (!hw_dom->hw_ctrl)
+				continue;
+			if (hw_dom->hw_ctrl->type == CBQRI_CONTROLLER_TYPE_CAPACITY)
+				src = &hw_dom->hw_ctrl->cache.cpu_mask;
+			else
+				src = &hw_dom->hw_ctrl->mem.cpu_mask;
+			if (!cpumask_test_cpu(cpu, src))
+				continue;
+			if (online)
+				cpumask_set_cpu(cpu, &cdom->hdr.cpu_mask);
+			else
+				cpumask_clear_cpu(cpu, &cdom->hdr.cpu_mask);
+		}
+
+		/*
+		 * Mon_domain ids equal their paired ctrl_domain id (set by
+		 * qos_resctrl_add_controller_domain() at L3), so the
+		 * controller's cpu_mask is reachable through the same-id
+		 * ctrl_domain.
+		 */
+		list_for_each_entry(mdom, &cr->resctrl_res.mon_domains, hdr.list) {
+			cdom = (struct rdt_ctrl_domain *)
+				resctrl_find_domain(&cr->resctrl_res.ctrl_domains,
+						    mdom->hdr.id, NULL);
+			if (!cdom)
+				continue;
+			hw_dom = container_of(cdom, struct cbqri_resctrl_dom,
+					      resctrl_ctrl_dom);
+			if (!hw_dom->hw_ctrl ||
+			    !cpumask_test_cpu(cpu, &hw_dom->hw_ctrl->cache.cpu_mask))
+				continue;
+			if (online)
+				cpumask_set_cpu(cpu, &mdom->hdr.cpu_mask);
+			else
+				cpumask_clear_cpu(cpu, &mdom->hdr.cpu_mask);
+		}
+	}
+}
+
 int qos_resctrl_online_cpu(unsigned int cpu)
 {
+	/*
+	 * Hardware resets CSR_SRMCFG to 0 when a CPU is offlined/re-onlined.
+	 * Zero the cached value so the next context switch always re-programs
+	 * the CSR rather than skipping it as "unchanged".
+	 */
+	per_cpu(cpu_srmcfg, cpu) = 0;
+	mutex_lock(&qos_domain_list_lock);
+	qos_domain_update_cpu(cpu, true);
+	mutex_unlock(&qos_domain_list_lock);
 	resctrl_online_cpu(cpu);
 	return 0;
 }
 
 int qos_resctrl_offline_cpu(unsigned int cpu)
 {
+	/*
+	 * Clear the departing CPU from each domain's cpu_mask BEFORE
+	 * resctrl_offline_cpu() runs.  resctrl_offline_cpu() calls
+	 * get_mon_domain_from_cpu() and mbm_setup_overflow_handler()
+	 * to migrate pending MBM work off the leaving CPU; if the bit
+	 * is still set, those helpers may pick the very CPU being torn
+	 * down to host the next overflow tick.  This also makes the
+	 * online/offline ordering symmetric with qos_resctrl_online_cpu(),
+	 * which sets the bit before the resctrl call.
+	 */
+	mutex_lock(&qos_domain_list_lock);
+	qos_domain_update_cpu(cpu, false);
+	mutex_unlock(&qos_domain_list_lock);
 	resctrl_offline_cpu(cpu);
 	return 0;
 }
