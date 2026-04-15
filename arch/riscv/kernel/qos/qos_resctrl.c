@@ -688,12 +688,46 @@ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
 			   u32 closid, u32 rmid, enum resctrl_event_id eventid,
 			   void *arch_priv, u64 *val, void *arch_mon_ctx)
 {
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	struct rdt_ctrl_domain *d;
+	u64 ctr_val;
+	int err;
+
+	if (eventid != QOS_L3_OCCUP_EVENT_ID)
+		return -EINVAL;
+
 	/*
-	 * Cache occupancy and bandwidth monitoring are not yet implemented
-	 * for RISC-V CBQRI. This will be added in a future series once the
-	 * resctrl framework supports monitoring domains at non-L3 scopes.
+	 * The monitoring domain shares the same id as the control domain.
+	 * Find the control domain to get the hw_ctrl pointer.
 	 */
-	return -EOPNOTSUPP;
+	d = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+							  hdr->id, NULL);
+	if (!d)
+		return -ENOENT;
+
+	hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+	ctrl = hw_dom->hw_ctrl;
+
+	spin_lock(&ctrl->lock);
+
+	/*
+	 * All MCIDs are configured with the Occupancy event at init time
+	 * (qos_init_mon_counters). Just snapshot the current value.
+	 */
+	err = cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_READ_COUNTER,
+			      rmid, 0, NULL);
+	if (err)
+		goto out;
+
+	ctr_val = ioread64(ctrl->base + CBQRI_CC_MON_CTL_VAL_OFF);
+
+	/* Convert from capacity blocks to bytes */
+	*val = ctr_val * (ctrl->cache.cache_size / ctrl->cc.ncblks);
+
+out:
+	spin_unlock(&ctrl->lock);
+	return err;
 }
 
 void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
