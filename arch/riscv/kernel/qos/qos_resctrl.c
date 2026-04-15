@@ -19,6 +19,7 @@
 static struct cbqri_resctrl_res cbqri_resctrl_resources[RDT_NUM_RESOURCES];
 
 static bool exposed_alloc_capable;
+static bool exposed_mon_capable;
 /* CDP (code data prioritization) on x86 is AT (access type) on RISC-V */
 static bool exposed_cdp_l2_capable;
 static bool exposed_cdp_l3_capable;
@@ -302,6 +303,7 @@ static int cbqri_probe_feature(struct cbqri_controller *ctrl, int reg_offset,
 
 static int cbqri_probe_cc(struct cbqri_controller *ctrl)
 {
+	bool has_mon_at_code;
 	int err, status;
 	u64 reg;
 
@@ -319,7 +321,17 @@ static int cbqri_probe_cc(struct cbqri_controller *ctrl)
 		 ctrl->ver_major, ctrl->ver_minor,
 		 ctrl->cc.ncblks, ctrl->cache.cache_level);
 
-	/* Probe allocation features (monitoring not yet implemented) */
+	/* Probe monitoring features */
+	err = cbqri_probe_feature(ctrl, CBQRI_CC_MON_CTL_OFF,
+				  CBQRI_CC_MON_CTL_OP_READ_COUNTER, &status,
+				  &has_mon_at_code);
+	if (err)
+		return err;
+
+	if (status == CBQRI_CC_MON_CTL_STATUS_SUCCESS)
+		ctrl->mon_capable = true;
+
+	/* Probe allocation features */
 	err = cbqri_probe_feature(ctrl, CBQRI_CC_ALLOC_CTL_OFF,
 				  CBQRI_CC_ALLOC_CTL_OP_READ_LIMIT,
 				  &status, &ctrl->cc.supports_alloc_at_code);
@@ -439,8 +451,7 @@ bool resctrl_arch_alloc_capable(void)
 
 bool resctrl_arch_mon_capable(void)
 {
-	/* Monitoring not yet implemented */
-	return false;
+	return exposed_mon_capable;
 }
 
 bool resctrl_arch_get_cdp_enabled(enum resctrl_res_level rid)

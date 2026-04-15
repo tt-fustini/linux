@@ -49,6 +49,7 @@ struct cbqri_controller {
 	struct riscv_cbqri_capacity_caps cc;
 
 	bool alloc_capable;
+	bool mon_capable;
 
 	phys_addr_t addr;
 	phys_addr_t size;
