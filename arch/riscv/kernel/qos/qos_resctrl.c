@@ -733,22 +733,47 @@ out:
 void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
 			     u32 closid, u32 rmid, enum resctrl_event_id eventid)
 {
-	/* Monitoring not yet supported; nothing to reset */
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	struct rdt_ctrl_domain *cd;
+
+	if (eventid != QOS_L3_OCCUP_EVENT_ID)
+		return;
+
+	cd = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+							   d->hdr.id, NULL);
+	if (!cd)
+		return;
+
+	hw_dom = container_of(cd, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+	ctrl = hw_dom->hw_ctrl;
+
+	spin_lock(&ctrl->lock);
+	/* CONFIG_EVENT with EVT_ID=None stops counting and resets counter */
+	cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
+			rmid, CBQRI_CC_EVT_ID_NONE, NULL);
+	spin_unlock(&ctrl->lock);
 }
 
 void resctrl_arch_mon_event_config_read(void *info)
 {
-	/* Monitoring not yet supported; no event config */
+	/* Event config not supported */
 }
 
 void resctrl_arch_mon_event_config_write(void *info)
 {
-	/* Monitoring not yet supported; no event config */
+	/* Event config not supported */
 }
 
 void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_l3_mon_domain *d)
 {
-	/* Monitoring not yet supported; nothing to reset */
+	struct cbqri_resctrl_res *hw_res;
+	int i;
+
+	hw_res = container_of(r, struct cbqri_resctrl_res, resctrl_res);
+
+	for (i = 0; i < hw_res->max_mcid; i++)
+		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_OCCUP_EVENT_ID);
 }
 
 void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
