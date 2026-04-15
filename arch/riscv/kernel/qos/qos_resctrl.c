@@ -124,6 +124,39 @@ static int cbqri_cc_alloc_op(struct cbqri_controller *ctrl, int operation, int r
 }
 
 /*
+ * Perform capacity usage monitoring operation on capacity controller.
+ * Caller must hold ctrl->lock.
+ */
+static int cbqri_cc_mon_op(struct cbqri_controller *ctrl, int operation,
+			   int mcid, int evt_id, u64 *out_reg)
+{
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_CC_MON_CTL_OFF);
+	reg &= ~CBQRI_MON_CTL_OP_MASK;
+	reg |= FIELD_PREP(CBQRI_MON_CTL_OP_MASK, operation);
+	reg &= ~CBQRI_MON_CTL_MCID_MASK;
+	reg |= FIELD_PREP(CBQRI_MON_CTL_MCID_MASK, mcid);
+	reg &= ~CBQRI_MON_CTL_EVT_ID_MASK;
+	reg |= FIELD_PREP(CBQRI_MON_CTL_EVT_ID_MASK, evt_id);
+	iowrite64(reg, ctrl->base + CBQRI_CC_MON_CTL_OFF);
+
+	if (cbqri_wait_busy_flag(ctrl, CBQRI_CC_MON_CTL_OFF, &reg) < 0) {
+		pr_err("%s(): BUSY timeout\n", __func__);
+		return -EIO;
+	}
+
+	if (FIELD_GET(CBQRI_MON_CTL_STATUS_MASK, reg) !=
+	    CBQRI_CC_MON_CTL_STATUS_SUCCESS)
+		return -EIO;
+
+	if (out_reg)
+		*out_reg = reg;
+
+	return 0;
+}
+
+/*
  * Write a capacity block mask and verify the hardware accepted it by
  * reading back the value after a CONFIG_LIMIT + READ_LIMIT sequence.
  */
@@ -889,6 +922,14 @@ static int qos_init_cache_resource(struct cbqri_controller *ctrl,
 	res->cache.cbm_len = ctrl->cc.ncblks;
 	res->cache.shareable_bits = resctrl_get_default_ctrl(res);
 	res->cache.min_cbm_bits = 1;
+
+	if (ctrl->mon_capable && scope == RESCTRL_L3_CACHE) {
+		res->mon_capable = true;
+		res->mon_scope = RESCTRL_L3_CACHE;
+		res->mon.num_rmid = ctrl->mcid_count;
+		resctrl_enable_mon_event(QOS_L3_OCCUP_EVENT_ID, false, 0, NULL);
+	}
+
 	return 0;
 }
 
@@ -925,6 +966,23 @@ static int qos_init_membw_resource(struct cbqri_controller *ctrl,
 	res->membw.min_bw = 1;
 	res->membw.max_bw = DIV_ROUND_UP(ctrl->bc.mrbwb * 100, ctrl->bc.nbwblks);
 	res->membw.bw_gran = 1;
+	return 0;
+}
+
+static int qos_init_mon_counters(struct cbqri_controller *ctrl)
+{
+	int i, err;
+
+	spin_lock(&ctrl->lock);
+	for (i = 0; i < ctrl->mcid_count; i++) {
+		err = cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
+				      i, CBQRI_CC_EVT_ID_OCCUPANCY, NULL);
+		if (err) {
+			spin_unlock(&ctrl->lock);
+			return err;
+		}
+	}
+	spin_unlock(&ctrl->lock);
 	return 0;
 }
 
@@ -1007,9 +1065,59 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl)
 		goto err_free_domain;
 	}
 
+	/* Create monitoring domain for L3 capacity controllers */
+	if (ctrl->type == CBQRI_CONTROLLER_TYPE_CAPACITY &&
+	    ctrl->mon_capable && ctrl->cache.cache_level == 3) {
+		struct cbqri_resctrl_dom *hw_dom;
+		struct rdt_l3_mon_domain *mon_dom;
+		struct list_head *mon_pos = NULL;
+
+		mon_dom = kzalloc(sizeof(*mon_dom), GFP_KERNEL);
+		if (!mon_dom) {
+			err = -ENOMEM;
+			goto err_offline_ctrl_domain;
+		}
+
+		mon_dom->hdr.id = domain->hdr.id;
+		mon_dom->hdr.type = RESCTRL_MON_DOMAIN;
+		mon_dom->hdr.rid = RDT_RESOURCE_L3;
+		cpumask_copy(&mon_dom->hdr.cpu_mask, &ctrl->cache.cpu_mask);
+		INIT_LIST_HEAD(&mon_dom->hdr.list);
+
+		hw_dom = container_of(domain, struct cbqri_resctrl_dom,
+				      resctrl_ctrl_dom);
+		hw_dom->resctrl_mon_dom = mon_dom;
+
+		resctrl_find_domain(&res->mon_domains, mon_dom->hdr.id, &mon_pos);
+		if (mon_pos)
+			list_add_tail(&mon_dom->hdr.list, mon_pos);
+		else
+			list_add_tail(&mon_dom->hdr.list, &res->mon_domains);
+
+		err = resctrl_online_mon_domain(res, &mon_dom->hdr);
+		if (err) {
+			list_del(&mon_dom->hdr.list);
+			kfree(mon_dom);
+			hw_dom->resctrl_mon_dom = NULL;
+			goto err_offline_ctrl_domain;
+		}
+
+		err = qos_init_mon_counters(ctrl);
+		if (err) {
+			resctrl_offline_mon_domain(res, &mon_dom->hdr);
+			list_del(&mon_dom->hdr.list);
+			kfree(mon_dom);
+			hw_dom->resctrl_mon_dom = NULL;
+			goto err_offline_ctrl_domain;
+		}
+	}
+
 out:
 	return 0;
 
+err_offline_ctrl_domain:
+	resctrl_offline_ctrl_domain(res, domain);
+	list_del(&domain->hdr.list);
 err_free_domain:
 	kfree(container_of(domain, struct cbqri_resctrl_dom, resctrl_ctrl_dom));
 	return err;
@@ -1057,9 +1165,13 @@ int qos_resctrl_setup(void)
 			else
 				exposed_cdp_l3_capable = true;
 		}
+
+		if (ctrl->type == CBQRI_CONTROLLER_TYPE_CAPACITY &&
+		    ctrl->mon_capable && ctrl->cache.cache_level == 3)
+			exposed_mon_capable = true;
 	}
-	pr_debug("alloc=%d cdp_l2=%d cdp_l3=%d\n",
-		 exposed_alloc_capable,
+	pr_debug("alloc=%d mon=%d cdp_l2=%d cdp_l3=%d\n",
+		 exposed_alloc_capable, exposed_mon_capable,
 		 exposed_cdp_l2_capable, exposed_cdp_l3_capable);
 
 	err = resctrl_init();
@@ -1070,7 +1182,15 @@ int qos_resctrl_setup(void)
 
 err_free_controllers_list:
 	for (i = 0; i < RDT_NUM_RESOURCES; i++) {
+		struct rdt_l3_mon_domain *mon_d, *mon_tmp;
+
 		res = &cbqri_resctrl_resources[i];
+		list_for_each_entry_safe(mon_d, mon_tmp,
+					 &res->resctrl_res.mon_domains, hdr.list) {
+			resctrl_offline_mon_domain(&res->resctrl_res, &mon_d->hdr);
+			list_del(&mon_d->hdr.list);
+			kfree(mon_d);
+		}
 		list_for_each_entry_safe(domain, domain_temp, &res->resctrl_res.ctrl_domains,
 					 hdr.list) {
 			resctrl_offline_ctrl_domain(&res->resctrl_res, domain);
