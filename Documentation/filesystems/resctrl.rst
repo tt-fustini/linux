@@ -975,6 +975,81 @@ is formatted as:
 
 	SMBA:<cache_id0>=bandwidth0;<cache_id1>=bandwidth1;...
 
+Reserved Bandwidth Blocks (RBWB) and Mweight (MWEIGHT)
+------------------------------------------------------
+RISC-V platforms implementing the CBQRI (Capacity and Bandwidth QoS
+Register Interface) specification expose bandwidth controllers with
+reservation semantics instead of per-group caps. Two schema resources
+are presented:
+
+``RBWB`` — Reserved Bandwidth Blocks
+  Each group's value is the number of bandwidth blocks guaranteed to
+  its RCID, as defined by CBQRI §4.5. Unlike MBA percentages, RBWB
+  values have a hard cross-group constraint::
+
+	sum(RBWB across all CLOSIDs in a domain) <= MRBWB
+
+  MRBWB (the Maximum Reserved Bandwidth Blocks advertised by the
+  CBQRI controller) is both the per-group ceiling and the domain-wide
+  budget. ``min_bandwidth = 1`` and ``bandwidth_gran = 1`` are exposed
+  in ``info/RBWB/``. A write that would push the sum over the MRBWB
+  budget is rejected with ``-ENOSPC``. New groups are created at
+  ``min_bandwidth`` so ``mkdir`` does not overflow the sum; userspace
+  must write a larger value into the group's ``schemata`` to grow its
+  reservation.
+
+  Schemata format::
+
+	RBWB:<dom_id0>=<blocks0>;<dom_id1>=<blocks1>;...
+
+``MWEIGHT`` — Opportunistic Bandwidth Weight
+  Controls how unreserved and unused bandwidth is distributed during
+  contention. Per CBQRI §4.5, a group's share of the leftover pool is
+  proportional to its Mweight. A value of ``0`` disables
+  work-conserving behavior for that group (hard cap at RBWB). Non-zero
+  values (1–255) compete for the leftover pool. There is no sum
+  constraint on MWEIGHT. Default value is ``255`` (equal opportunistic
+  shares).
+
+  Schemata format::
+
+	MWEIGHT:<dom_id0>=<weight0>;<dom_id1>=<weight1>;...
+
+RBWB and MWEIGHT are independent resources: writing one does not alter
+the other. The ``mba_MBps`` mount option applies only to the MBA
+resource (which requires L3 monitoring and a linear MBA scale); it has
+no effect on RBWB or MWEIGHT. On systems that expose RBWB/MWEIGHT but
+not MBA, the mount will be rejected with ``-EINVAL``.
+
+Info files for RBWB and MWEIGHT reuse the generic memory-bandwidth set
+(the same files exposed for MBA and SMBA):
+
+``info/RBWB/min_bandwidth``
+  Minimum RBWB value a group may be configured with. Fixed at ``1``
+  (zero is reserved because it would deassert the RCID's reservation
+  and is disallowed by CBQRI §4.5 for active groups).
+
+``info/RBWB/bandwidth_gran``
+  Granularity of an RBWB write. Always ``1``: values are integer
+  block counts.
+
+``info/RBWB/delay_linear``
+  Always ``0``. RBWB is an integer block reservation, not a throttle
+  percentage, so the MBA linear-delay concept does not apply. The file
+  is retained for interface uniformity with MBA/SMBA.
+
+``info/MWEIGHT/min_bandwidth``
+  Minimum MWEIGHT value. Fixed at ``0``; ``0`` is a valid weight that
+  opts the group out of work-conserving sharing.
+
+``info/MWEIGHT/bandwidth_gran``
+  Always ``1``: MWEIGHT is an integer in [0, 255].
+
+``info/MWEIGHT/delay_linear``
+  Always ``0``. MWEIGHT is a dimensionless ratio; the MBA linear-delay
+  concept does not apply. The file is retained for interface
+  uniformity with MBA/SMBA.
+
 Reading/writing the schemata file
 ---------------------------------
 Reading the schemata file will show the state of all resources
