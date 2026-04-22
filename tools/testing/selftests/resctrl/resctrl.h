@@ -246,5 +246,7 @@ extern struct resctrl_test cmt_test;
 extern struct resctrl_test l3_cat_test;
 extern struct resctrl_test l3_noncont_cat_test;
 extern struct resctrl_test l2_noncont_cat_test;
+extern struct resctrl_test rbwb_test;
+extern struct resctrl_test mweight_test;
 
 #endif /* RESCTRL_H */
