@@ -109,7 +109,6 @@ static int get_cache_level(const char *cache_type)
 	if (!strcmp(cache_type, "L2"))
 		return 2;
 
-	ksft_print_msg("Invalid cache level\n");
 	return -1;
 }
 
@@ -122,10 +121,55 @@ static int get_resource_cache_level(const char *resource)
 }
 
 /*
+ * get_schemata_domain_id - Get first domain ID for a resource from schemata.
+ * @resource:	resource name
+ * @domain_id:	first domain ID found for the resource
+ *
+ * Used for non-cache resources (e.g. RISC-V CBQRI bandwidth resources like
+ * RBWB and MWEIGHT) whose domain IDs are not tied to CPU cache topology.
+ * Requires resctrl to be mounted.
+ *
+ * Return: 0 on success, < 0 on failure.
+ */
+static int get_schemata_domain_id(const char *resource, int *domain_id)
+{
+	char path[PATH_MAX];
+	char line[1024];
+	FILE *fp;
+
+	snprintf(path, sizeof(path), "%s/schemata", RESCTRL_PATH);
+	fp = fopen(path, "r");
+	if (!fp)
+		return -1;
+
+	while (fgets(line, sizeof(line), fp)) {
+		char *res = line;
+		char *colon;
+
+		while (*res == ' ' || *res == '\t')
+			res++;
+		colon = strchr(res, ':');
+		if (!colon)
+			continue;
+		*colon++ = '\0';
+		if (strcmp(res, resource) != 0)
+			continue;
+		if (sscanf(colon, "%d=", domain_id) == 1) {
+			fclose(fp);
+			return 0;
+		}
+	}
+
+	fclose(fp);
+	return -1;
+}
+
+/*
  * get_domain_id - Get resctrl domain ID for a specified CPU
  * @resource:	resource name
  * @cpu_no:	CPU number
- * @domain_id:	domain ID (cache ID; for MB, L3 cache ID)
+ * @domain_id:	domain ID (cache ID; for MB, L3 cache ID; for non-cache
+ *		resources, first domain ID from schemata)
  *
  * Return: >= 0 on success, < 0 on failure.
  */
@@ -136,8 +180,15 @@ int get_domain_id(const char *resource, int cpu_no, int *domain_id)
 	FILE *fp;
 
 	cache_num = get_resource_cache_level(resource);
-	if (cache_num < 0)
-		return cache_num;
+	if (cache_num < 0) {
+		/* Not a cache resource; find domain from mounted schemata. */
+		if (get_schemata_domain_id(resource, domain_id) < 0) {
+			ksft_print_msg("Could not get domain ID for %s\n",
+				       resource);
+			return -1;
+		}
+		return 0;
+	}
 
 	sprintf(phys_pkg_path, "%s%d/cache/index%d/id", PHYS_ID_PATH, cpu_no, cache_num);
 
