@@ -1050,6 +1050,45 @@ Info files for RBWB and MWEIGHT reuse the generic memory-bandwidth set
   concept does not apply. The file is retained for interface
   uniformity with MBA/SMBA.
 
+CBQRI bandwidth monitoring (L3 ``mbm_total_bytes``)
+---------------------------------------------------
+On RISC-V platforms where a CBQRI bandwidth controller (BC) shares
+topology with an L3 cache controller (same set of CPUs per PPTT/RQSC),
+the BC's per-MCID bandwidth counter is exposed through the L3
+monitoring domain as the ``mbm_total_bytes`` event. No separate
+memory-controller monitoring resource is added; the BC's counter
+simply backs the existing ``QOS_L3_MBM_TOTAL_EVENT_ID`` so that
+``/sys/fs/resctrl/mon_data/mon_L3_<id>/mbm_total_bytes`` reports
+accumulated read+write bytes attributable to each resctrl group's
+MCID. This mirrors the approach taken by the ARM MPAM driver for
+memory-system MSCs that do not sit on an Intel-style L3 (see the
+discussion threads linked from the CBQRI resctrl patch series).
+
+Implications for userspace:
+
+* ``info/L3_MON/mon_features`` advertises ``mbm_total_bytes`` only.
+  ``mbm_local_bytes`` is deliberately NOT advertised because the BC
+  sits on a single memory controller and cannot attribute reads by
+  destination NUMA node; exposing a "local" event would give
+  indistinguishable-from-total semantics and mislead userspace.
+
+* The ``mon_L3_<id>`` domain id is the L3 cache id (from PPTT) even
+  when the counter physically lives on a BC whose RQSC proximity
+  domain resolves to the same set of online CPUs. Reads follow the
+  paired BC automatically; userspace sees a single domain id for the
+  combined cache-occupancy + memory-bandwidth view.
+
+* MBM_TOTAL is advertised only when the platform exposes exactly one
+  mon-capable CBQRI bandwidth controller. That single BC is paired
+  with every L3 monitoring domain, on the assumption that all memory
+  traffic observed at any LLC necessarily flows through the one
+  memory controller. On platforms with zero BCs, or with two or more
+  mon-capable BCs, no ``mbm_total_bytes`` file appears: with multiple
+  BCs there is no honest way to attribute an L3's traffic to a single
+  counter without per-BC scope support in resctrl, which does not yet
+  exist. Tightening this when resctrl gains memory-controller scope
+  is a follow-up.
+
 Reading/writing the schemata file
 ---------------------------------
 Reading the schemata file will show the state of all resources
