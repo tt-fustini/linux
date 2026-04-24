@@ -23,6 +23,7 @@ static struct resctrl_test *resctrl_tests[] = {
 	&l2_noncont_cat_test,
 	&mb_min_test,
 	&mb_wght_test,
+	&cbqri_mbm_test,
 };
 
 static unsigned int detect_vendor(void)

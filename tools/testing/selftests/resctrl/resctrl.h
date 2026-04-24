@@ -248,5 +248,6 @@ extern struct resctrl_test l3_noncont_cat_test;
 extern struct resctrl_test l2_noncont_cat_test;
 extern struct resctrl_test mb_min_test;
 extern struct resctrl_test mb_wght_test;
+extern struct resctrl_test cbqri_mbm_test;
 
 #endif /* RESCTRL_H */
