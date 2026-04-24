@@ -15,6 +15,8 @@
 #define CBQRI_CC_BLOCK_MASK_OFF  32
 
 #define CBQRI_BC_CAPABILITIES_OFF 0
+#define CBQRI_BC_MON_CTL_OFF      8
+#define CBQRI_BC_MON_CTL_VAL_OFF 16
 #define CBQRI_BC_ALLOC_CTL_OFF   24
 #define CBQRI_BC_BW_ALLOC_OFF    32
 
@@ -51,6 +53,10 @@
 #define CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT   2
 #define CBQRI_BC_ALLOC_CTL_STATUS_SUCCESS  1
 
+#define CBQRI_BC_MON_CTL_OP_CONFIG_EVENT 1
+#define CBQRI_BC_MON_CTL_OP_READ_COUNTER 2
+#define CBQRI_BC_MON_CTL_STATUS_SUCCESS  1
+
 /* cc_mon_ctl / bc_mon_ctl field masks (same layout as alloc_ctl plus EVT_ID) */
 #define CBQRI_MON_CTL_OP_MASK        GENMASK(4, 0)
 #define CBQRI_MON_CTL_MCID_MASK      GENMASK(19, 8)
@@ -60,6 +66,17 @@
 /* Capacity usage monitoring event IDs (CBQRI spec Table 4) */
 #define CBQRI_CC_EVT_ID_NONE         0
 #define CBQRI_CC_EVT_ID_OCCUPANCY    1
+
+/* Bandwidth usage monitoring event IDs (CBQRI spec Table 10) */
+#define CBQRI_BC_EVT_ID_NONE              0
+#define CBQRI_BC_EVT_ID_TOTAL_READ_WRITE  1
+#define CBQRI_BC_EVT_ID_TOTAL_READ        2
+#define CBQRI_BC_EVT_ID_TOTAL_WRITE       3
+
+/* bc_mon_ctr_val layout (CBQRI spec §4.2) */
+#define CBQRI_BC_MON_CTR_VAL_CTR_MASK    GENMASK_ULL(61, 0)
+#define CBQRI_BC_MON_CTR_VAL_INVALID     BIT_ULL(62)
+#define CBQRI_BC_MON_CTR_VAL_OVF         BIT_ULL(63)
 
 int qos_resctrl_setup(void);
 int qos_resctrl_online_cpu(unsigned int cpu);
