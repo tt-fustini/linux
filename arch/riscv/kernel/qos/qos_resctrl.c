@@ -251,6 +251,38 @@ out:
 	return err;
 }
 
+/*
+ * Perform bandwidth usage monitoring operation on bandwidth controller.
+ * Caller must hold ctrl->lock.
+ */
+static int cbqri_bc_mon_op(struct cbqri_controller *ctrl, int operation,
+			   int mcid, int evt_id, u64 *out_reg)
+{
+	u64 reg;
+
+	if (ctrl->faulted)
+		return -EIO;
+
+	reg = FIELD_PREP(CBQRI_MON_CTL_OP_MASK, operation) |
+	      FIELD_PREP(CBQRI_MON_CTL_MCID_MASK, mcid) |
+	      FIELD_PREP(CBQRI_MON_CTL_EVT_ID_MASK, evt_id);
+	iowrite64(reg, ctrl->base + CBQRI_BC_MON_CTL_OFF);
+
+	if (cbqri_wait_busy_flag(ctrl, CBQRI_BC_MON_CTL_OFF, &reg) < 0) {
+		pr_err("%s(): BUSY timeout\n", __func__);
+		return -EIO;
+	}
+
+	if (FIELD_GET(CBQRI_MON_CTL_STATUS_MASK, reg) !=
+	    CBQRI_BC_MON_CTL_STATUS_SUCCESS)
+		return -EIO;
+
+	if (out_reg)
+		*out_reg = reg;
+
+	return 0;
+}
+
 /* Perform bandwidth allocation control operation on bandwidth controller */
 /* Caller must hold ctrl->lock. */
 static int cbqri_bc_alloc_op(struct cbqri_controller *ctrl, int operation, int rcid)
@@ -500,6 +532,7 @@ static int cbqri_probe_cc(struct cbqri_controller *ctrl)
 
 static int cbqri_probe_bc(struct cbqri_controller *ctrl)
 {
+	bool has_mon_at_code;
 	int err, status;
 	u64 reg;
 
@@ -521,7 +554,17 @@ static int cbqri_probe_bc(struct cbqri_controller *ctrl)
 		 ctrl->ver_major, ctrl->ver_minor,
 		 ctrl->bc.nbwblks, ctrl->bc.mrbwb);
 
-	/* Probe allocation features (monitoring not yet implemented) */
+	/* Probe monitoring features */
+	err = cbqri_probe_feature(ctrl, CBQRI_BC_MON_CTL_OFF,
+				  CBQRI_BC_MON_CTL_OP_READ_COUNTER, &status,
+				  &has_mon_at_code);
+	if (err)
+		return err;
+
+	if (status == CBQRI_BC_MON_CTL_STATUS_SUCCESS)
+		ctrl->mon_capable = true;
+
+	/* Probe allocation features */
 	err = cbqri_probe_feature(ctrl, CBQRI_BC_ALLOC_CTL_OFF,
 				  CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT,
 				  &status, &ctrl->bc.supports_alloc_at_code);
