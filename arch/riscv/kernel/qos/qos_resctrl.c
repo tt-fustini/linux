@@ -663,6 +663,32 @@ err_release:
 	return err;
 }
 
+/*
+ * Pair every L3 with the single mon-capable bandwidth controller in the
+ * system, mirroring MPAM's strict "one MSC, one L3" mapping.  CBQRI BCs
+ * live at memory-controller scope, which resctrl does not represent;
+ * the only honest way to surface BC counters as MBM_TOTAL at L3 scope
+ * is to require that there is exactly one BC, so all memory traffic
+ * observed at the LLC necessarily flows through it.  If the platform
+ * exposes zero or more than one mon-capable BC, no L3 gets a paired
+ * BC and MBM_TOTAL is not advertised.
+ */
+static struct cbqri_controller *cbqri_find_only_mon_bc(void)
+{
+	struct cbqri_controller *ctrl, *only_bc = NULL;
+
+	list_for_each_entry(ctrl, &cbqri_controllers, list) {
+		if (ctrl->type != CBQRI_CONTROLLER_TYPE_BANDWIDTH)
+			continue;
+		if (!ctrl->mon_capable)
+			continue;
+		if (only_bc)
+			return NULL;
+		only_bc = ctrl;
+	}
+	return only_bc;
+}
+
 bool resctrl_arch_alloc_capable(void)
 {
 	return exposed_alloc_capable;
