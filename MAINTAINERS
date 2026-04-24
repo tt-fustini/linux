@@ -23021,6 +23021,7 @@ F:	drivers/resctrl/cbqri_internal.h
 F:	drivers/resctrl/cbqri_resctrl.c
 F:	include/linux/riscv_cbqri.h
 F:	tools/testing/selftests/resctrl/cbqri_bw_test.c
+F:	tools/testing/selftests/resctrl/cbqri_mbm_test.c
 
 RISC-V RPMI AND MPXY DRIVERS
 M:	Rahul Pathak <rahul@summations.net>
