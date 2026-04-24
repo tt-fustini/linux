@@ -911,44 +911,81 @@ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
 {
 	struct cbqri_resctrl_dom *hw_dom;
 	struct cbqri_controller *ctrl;
+	struct cbqri_controller *bc;
 	struct rdt_ctrl_domain *d;
 	u64 ctr_val;
 	int err;
 
-	if (eventid != QOS_L3_OCCUP_EVENT_ID)
+	switch (eventid) {
+	case QOS_L3_OCCUP_EVENT_ID:
+		/*
+		 * The monitoring domain shares the same id as the control
+		 * domain.  Find the control domain to get the hw_ctrl pointer.
+		 */
+		d = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+								  hdr->id, NULL);
+		if (!d)
+			return -ENOENT;
+
+		hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		ctrl = hw_dom->hw_ctrl;
+
+		mutex_lock(&ctrl->lock);
+
+		/*
+		 * All MCIDs are configured with the Occupancy event at init
+		 * time (qos_init_mon_counters).  Just snapshot the value.
+		 */
+		err = cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_READ_COUNTER,
+				      rmid, 0, NULL);
+		if (err)
+			goto out_cc;
+
+		ctr_val = ioread64(ctrl->base + CBQRI_CC_MON_CTL_VAL_OFF);
+
+		/* Convert from capacity blocks to bytes */
+		*val = ctr_val * (ctrl->cache.cache_size / ctrl->cc.ncblks);
+out_cc:
+		mutex_unlock(&ctrl->lock);
+		return err;
+
+	case QOS_L3_MBM_TOTAL_EVENT_ID:
+		/*
+		 * The L3 monitoring domain's id is the L3 cache id (see
+		 * qos_resctrl_add_controller_domain()).  The matching ctrl
+		 * domain's hw_dom->paired_bc was cached at add time so we
+		 * don't walk cbqri_controllers on every read.
+		 */
+		d = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+								  hdr->id, NULL);
+		if (!d)
+			return -ENOENT;
+		hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		bc = hw_dom->paired_bc;
+		if (!bc)
+			return -ENOENT;
+
+		mutex_lock(&bc->lock);
+		err = cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_READ_COUNTER,
+				      rmid, 0, NULL);
+		if (err)
+			goto out_bc;
+
+		ctr_val = ioread64(bc->base + CBQRI_BC_MON_CTL_VAL_OFF);
+		/*
+		 * CBQRI BC counts in bytes.  INVALID=1 means the counter has
+		 * been (re)configured but no traffic has been observed yet;
+		 * CTR is zero per spec in that case, so masking it off yields
+		 * the correct zero report.
+		 */
+		*val = ctr_val & CBQRI_BC_MON_CTR_VAL_CTR_MASK;
+out_bc:
+		mutex_unlock(&bc->lock);
+		return err;
+
+	default:
 		return -EINVAL;
-
-	/*
-	 * The monitoring domain shares the same id as the control domain.
-	 * Find the control domain to get the hw_ctrl pointer.
-	 */
-	d = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
-							  hdr->id, NULL);
-	if (!d)
-		return -ENOENT;
-
-	hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
-	ctrl = hw_dom->hw_ctrl;
-
-	mutex_lock(&ctrl->lock);
-
-	/*
-	 * All MCIDs are configured with the Occupancy event at init time
-	 * (qos_init_mon_counters). Just snapshot the current value.
-	 */
-	err = cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_READ_COUNTER,
-			      rmid, 0, NULL);
-	if (err)
-		goto out;
-
-	ctr_val = ioread64(ctrl->base + CBQRI_CC_MON_CTL_VAL_OFF);
-
-	/* Convert from capacity blocks to bytes */
-	*val = ctr_val * (ctrl->cache.cache_size / ctrl->cc.ncblks);
-
-out:
-	mutex_unlock(&ctrl->lock);
-	return err;
+	}
 }
 
 void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
@@ -956,24 +993,49 @@ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d
 {
 	struct cbqri_resctrl_dom *hw_dom;
 	struct cbqri_controller *ctrl;
+	struct cbqri_controller *bc;
 	struct rdt_ctrl_domain *cd;
 
-	if (eventid != QOS_L3_OCCUP_EVENT_ID)
+	switch (eventid) {
+	case QOS_L3_OCCUP_EVENT_ID:
+		cd = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+								   d->hdr.id, NULL);
+		if (!cd)
+			return;
+
+		hw_dom = container_of(cd, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		ctrl = hw_dom->hw_ctrl;
+
+		mutex_lock(&ctrl->lock);
+		/* CONFIG_EVENT with EVT_ID=None stops counting and resets counter */
+		cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
+				rmid, CBQRI_CC_EVT_ID_NONE, NULL);
+		mutex_unlock(&ctrl->lock);
 		return;
 
-	cd = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
-							   d->hdr.id, NULL);
-	if (!cd)
+	case QOS_L3_MBM_TOTAL_EVENT_ID:
+		cd = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+								   d->hdr.id, NULL);
+		if (!cd)
+			return;
+		hw_dom = container_of(cd, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		bc = hw_dom->paired_bc;
+		if (!bc)
+			return;
+
+		mutex_lock(&bc->lock);
+		/*
+		 * Reconfigure back to TOTAL_READ_WRITE: CBQRI's CONFIG_EVENT
+		 * clears the counter, so this both resets and re-arms.
+		 */
+		cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_CONFIG_EVENT,
+				rmid, CBQRI_BC_EVT_ID_TOTAL_READ_WRITE, NULL);
+		mutex_unlock(&bc->lock);
 		return;
 
-	hw_dom = container_of(cd, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
-	ctrl = hw_dom->hw_ctrl;
-
-	mutex_lock(&ctrl->lock);
-	/* CONFIG_EVENT with EVT_ID=None stops counting and resets counter */
-	cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
-			rmid, CBQRI_CC_EVT_ID_NONE, NULL);
-	mutex_unlock(&ctrl->lock);
+	default:
+		return;
+	}
 }
 
 void resctrl_arch_mon_event_config_read(void *info)
@@ -996,8 +1058,15 @@ void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_l3_mon_domai
 	 * to that subset so reset_rmid_all matches the index range that
 	 * resctrl_arch_system_num_rmid_idx() advertises.
 	 */
-	for (i = 0; i < max_rmid; i++)
+	for (i = 0; i < max_rmid; i++) {
 		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_OCCUP_EVENT_ID);
+		/*
+		 * Best effort: if an MBM_TOTAL event is enabled and a BC is
+		 * paired with this L3 domain, reset that counter too. The
+		 * reset_rmid() path silently ignores unpaired domains.
+		 */
+		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_MBM_TOTAL_EVENT_ID);
+	}
 }
 
 void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
@@ -1314,6 +1383,16 @@ static int qos_init_cache_resource(struct cbqri_controller *ctrl,
 		res->mon_scope = RESCTRL_L3_CACHE;
 		res->mon.num_rmid = ctrl->mcid_count;
 		resctrl_enable_mon_event(QOS_L3_OCCUP_EVENT_ID, false, 0, NULL);
+
+		/*
+		 * Expose BC bandwidth monitoring as the L3's MBM_TOTAL event
+		 * when a BC shares topology with this L3, mirroring MPAM's
+		 * "MB on L3" mapping.  The event is global; per-domain
+		 * availability is decided in resctrl_arch_rmid_read().
+		 */
+		if (cbqri_find_only_mon_bc())
+			resctrl_enable_mon_event(QOS_L3_MBM_TOTAL_EVENT_ID,
+						 false, 0, NULL);
 	}
 
 	return 0;
@@ -1415,6 +1494,28 @@ static int qos_init_mon_counters(struct cbqri_controller *ctrl)
 }
 
 /*
+ * Configure every MCID of a bandwidth controller to track combined
+ * read+write traffic.  Called when a BC is attached to an L3 monitoring
+ * domain so that later QOS_L3_MBM_TOTAL_EVENT_ID reads just snapshot
+ * the running counter.  CBQRI BC shares its mon_ctl layout with CC;
+ * only the event ID and register offset differ.
+ */
+static int qos_init_bc_mon_counters(struct cbqri_controller *bc)
+{
+	int i, err;
+
+	for (i = 0; i < bc->mcid_count; i++) {
+		mutex_lock(&bc->lock);
+		err = cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_CONFIG_EVENT,
+				      i, CBQRI_BC_EVT_ID_TOTAL_READ_WRITE, NULL);
+		mutex_unlock(&bc->lock);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
+/*
  * Allocate a fresh ctrl_domain, attach it to @ctrl, init its default
  * per-CLOSID values for resource @res, add to res->ctrl_domains, and
  * bring it online. On error, the domain is freed before return.
@@ -1482,6 +1583,7 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl)
 	struct rdt_resource *res = NULL;
 	struct rdt_resource *mw_res = NULL;
 	struct rdt_ctrl_domain *mw_domain = NULL;
+	struct cbqri_resctrl_dom *hw_dom;
 	int err;
 
 	switch (ctrl->type) {
@@ -1614,6 +1716,34 @@ static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl)
 			kfree(mon_dom);
 			goto err_ctrl;
 		}
+
+		/*
+		 * Attach any BC that shares topology with this L3 so its
+		 * combined read+write counter satisfies MBM_TOTAL reads
+		 * against this mon domain.  The lookup happens once here;
+		 * the hot-path read/reset in resctrl_arch_rmid_read() and
+		 * resctrl_arch_reset_rmid() use hw_dom->paired_bc directly.
+		 * Best-effort: a BC that fails to initialize just won't
+		 * contribute counts.
+		 */
+		hw_dom = container_of(domain, struct cbqri_resctrl_dom,
+				      resctrl_ctrl_dom);
+		hw_dom->paired_bc = cbqri_find_only_mon_bc();
+		if (hw_dom->paired_bc) {
+			int bc_err = qos_init_bc_mon_counters(hw_dom->paired_bc);
+
+			if (bc_err) {
+				pr_warn("BC @%pa: mon init failed (%d)\n",
+					&hw_dom->paired_bc->addr, bc_err);
+				/*
+				 * Drop the pairing so resctrl_arch_rmid_read()
+				 * and resctrl_arch_reset_rmid() short-circuit
+				 * with -ENOENT instead of issuing reads
+				 * against MCIDs that were never CONFIG_EVENT'd.
+				 */
+				hw_dom->paired_bc = NULL;
+			}
+		}
 	}
 
 	return 0;
@@ -1690,13 +1820,38 @@ int qos_resctrl_setup(void)
 		res->resctrl_res.rid = i;
 	}
 
+	/*
+	 * Pass 1: probe every controller so alloc_capable / mon_capable are
+	 * final on all BCs and CCs before any pairing decision runs.  This
+	 * mirrors MPAM's phased setup (mpam_resctrl_setup() runs after all
+	 * MSCs are probed via ACPI parse) and removes a latent RQSC-table-
+	 * order dependency: if a CC was listed before any BC, pass 2 would
+	 * otherwise look up BCs whose mon_capable is still false and
+	 * silently skip enabling QOS_L3_MBM_TOTAL_EVENT_ID.
+	 */
 	list_for_each_entry(ctrl, &cbqri_controllers, list) {
 		err = cbqri_probe_controller(ctrl);
 		if (err) {
-			pr_err("%s(): failed (%d)\n", __func__, err);
+			pr_err("%s(): probe failed (%d)\n", __func__, err);
 			goto err_free_controllers_list;
 		}
+	}
 
+	/*
+	 * Clamp the U32_MAX sentinel: if no probed controller narrowed
+	 * max_rmid (no controllers, or all have mcid_count == 0), no
+	 * monitoring is possible.  Leaving the sentinel in place would let
+	 * resctrl_arch_system_num_rmid_idx() return ~0 and any later
+	 * kcalloc(idx_limit, ...) overflow.
+	 */
+	if (max_rmid == U32_MAX)
+		max_rmid = 0;
+
+	/*
+	 * Pass 2: register domains with resctrl.  All pairing lookups
+	 * (cbqri_find_only_mon_bc) see stable mon_capable flags now.
+	 */
+	list_for_each_entry(ctrl, &cbqri_controllers, list) {
 		err = qos_resctrl_add_controller_domain(ctrl);
 		if (err) {
 			pr_err("%s(): failed to add controller domain (%d)\n", __func__, err);

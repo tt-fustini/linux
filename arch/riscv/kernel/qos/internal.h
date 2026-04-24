@@ -91,6 +91,13 @@ struct cbqri_resctrl_res {
 struct cbqri_resctrl_dom {
 	struct rdt_ctrl_domain  resctrl_ctrl_dom;
 	struct cbqri_controller *hw_ctrl;
+	/*
+	 * For an L3 capacity controller that is paired with a bandwidth
+	 * controller of matching topology, paired_bc caches that BC so
+	 * MBM_TOTAL reads/resets don't have to walk cbqri_controllers on
+	 * every hit.  NULL for non-L3 domains and L3s without a paired BC.
+	 */
+	struct cbqri_controller *paired_bc;
 };
 
 struct cbqri_config {
