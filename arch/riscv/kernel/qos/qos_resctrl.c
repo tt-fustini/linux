@@ -42,6 +42,47 @@ static void cbqri_set_cbm(struct cbqri_controller *ctrl, u64 cbm)
 {
 	iowrite64(cbm, ctrl->base + CBQRI_CC_BLOCK_MASK_OFF);
 }
+
+/* Set the Rbwb (reserved bandwidth blocks) field in bc_bw_alloc */
+static void cbqri_set_rbwb(struct cbqri_controller *ctrl, u64 rbwb)
+{
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+	reg &= ~CBQRI_CONTROL_REGISTERS_RBWB_MASK;
+	reg |= FIELD_PREP(CBQRI_CONTROL_REGISTERS_RBWB_MASK, rbwb);
+	iowrite64(reg, ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+}
+
+/* Get the Rbwb (reserved bandwidth blocks) field in bc_bw_alloc */
+static u64 cbqri_get_rbwb(struct cbqri_controller *ctrl)
+{
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+	return FIELD_GET(CBQRI_CONTROL_REGISTERS_RBWB_MASK, reg);
+}
+
+/* Set the Mweight (opportunistic weight) field in bc_bw_alloc */
+static void cbqri_set_mweight(struct cbqri_controller *ctrl, u64 mweight)
+{
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+	reg &= ~CBQRI_CONTROL_REGISTERS_MWEIGHT_MASK;
+	reg |= FIELD_PREP(CBQRI_CONTROL_REGISTERS_MWEIGHT_MASK, mweight);
+	iowrite64(reg, ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+}
+
+/* Get the Mweight (opportunistic weight) field in bc_bw_alloc */
+static u64 cbqri_get_mweight(struct cbqri_controller *ctrl)
+{
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+	return FIELD_GET(CBQRI_CONTROL_REGISTERS_MWEIGHT_MASK, reg);
+}
+
 static int cbqri_wait_busy_flag(struct cbqri_controller *ctrl, int reg_offset,
 				u64 *regp)
 {
@@ -209,6 +250,140 @@ out:
 	mutex_unlock(&ctrl->lock);
 	return err;
 }
+
+/* Perform bandwidth allocation control operation on bandwidth controller */
+/* Caller must hold ctrl->lock. */
+static int cbqri_bc_alloc_op(struct cbqri_controller *ctrl, int operation, int rcid)
+{
+	int reg_offset = CBQRI_BC_ALLOC_CTL_OFF;
+	int status;
+	u64 reg;
+
+	if (ctrl->faulted)
+		return -EIO;
+
+	reg = ioread64(ctrl->base + reg_offset);
+	reg &= ~CBQRI_CONTROL_REGISTERS_OP_MASK;
+	reg |= FIELD_PREP(CBQRI_CONTROL_REGISTERS_OP_MASK, operation);
+	reg &= ~CBQRI_CONTROL_REGISTERS_RCID_MASK;
+	reg |= FIELD_PREP(CBQRI_CONTROL_REGISTERS_RCID_MASK, rcid);
+	iowrite64(reg, ctrl->base + reg_offset);
+
+	if (cbqri_wait_busy_flag(ctrl, reg_offset, &reg) < 0) {
+		pr_err("%s(): BUSY timeout when executing the operation\n", __func__);
+		return -EIO;
+	}
+
+	status = FIELD_GET(CBQRI_CONTROL_REGISTERS_STATUS_MASK, reg);
+	if (status != CBQRI_BC_ALLOC_CTL_STATUS_SUCCESS) {
+		pr_err("%s(): operation %d failed with status = %d\n",
+		       __func__, operation, status);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/*
+ * Write one field (Rbwb or Mweight) of the bc_bw_alloc staging register for
+ * @closid and verify hardware accepted it. bc_bw_alloc packs both fields, so
+ * READ_LIMIT first loads the RCID's current state to preserve the unmodified
+ * field across the subsequent CONFIG_LIMIT.
+ *
+ * Caller must hold ctrl->lock.
+ */
+static int cbqri_apply_bc_field(struct cbqri_resctrl_dom *hw_dom, u32 closid,
+				void (*set)(struct cbqri_controller *, u64),
+				u64 (*get)(struct cbqri_controller *),
+				u64 val)
+{
+	struct cbqri_controller *ctrl = hw_dom->hw_ctrl;
+	int ret;
+	u64 reg;
+
+	/* Load current RCID state so the unmodified field is preserved */
+	ret = cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT, closid);
+	if (ret < 0)
+		return ret;
+
+	set(ctrl, val);
+
+	ret = cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_CONFIG_LIMIT, closid);
+	if (ret < 0)
+		return ret;
+
+	/* Clear field before read-back so a silent READ_LIMIT failure is caught */
+	set(ctrl, 0);
+
+	ret = cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT, closid);
+	if (ret < 0)
+		return ret;
+
+	reg = get(ctrl);
+	if (reg != val) {
+		pr_err("%s(): verify mismatch (reg=0x%llx != val=%llu)\n",
+		       __func__, reg, val);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/*
+ * Apply an Rbwb update for @closid.  The CBQRI §4.5 invariant
+ * sum(Rbwb across all RCIDs) <= MRBWB must hold after the write, so
+ * sum, validate, and apply all happen under one mutex acquisition --
+ * dropping the lock between sum and apply would let a concurrent
+ * resctrl writer change another RCID's Rbwb in the gap and silently
+ * over-allocate.
+ */
+static int cbqri_apply_bw_config(struct cbqri_resctrl_dom *hw_dom, u32 closid,
+				 enum resctrl_conf_type type, struct cbqri_config *cfg)
+{
+	struct cbqri_controller *ctrl = hw_dom->hw_ctrl;
+	u64 sum = 0;
+	int ret = 0;
+	u32 i;
+
+	mutex_lock(&ctrl->lock);
+
+	if (cfg->rbwb > 0) {
+		for (i = 0; i < ctrl->rcid_count; i++) {
+			if (i == closid)
+				continue;
+			if (cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT, i))
+				continue;
+			sum += cbqri_get_rbwb(ctrl);
+		}
+		if (sum + cfg->rbwb > ctrl->bc.mrbwb) {
+			pr_err("%s(): RBWB sum %llu exceeds MRBWB %u\n",
+			       __func__, sum + cfg->rbwb, ctrl->bc.mrbwb);
+			ret = -ENOSPC;
+			goto out;
+		}
+	}
+
+	ret = cbqri_apply_bc_field(hw_dom, closid,
+				   cbqri_set_rbwb, cbqri_get_rbwb, cfg->rbwb);
+out:
+	mutex_unlock(&ctrl->lock);
+	return ret;
+}
+
+static int cbqri_apply_mweight_config(struct cbqri_resctrl_dom *hw_dom, u32 closid,
+				      struct cbqri_config *cfg)
+{
+	struct cbqri_controller *ctrl = hw_dom->hw_ctrl;
+	int ret;
+
+	mutex_lock(&ctrl->lock);
+	ret = cbqri_apply_bc_field(hw_dom, closid,
+				   cbqri_set_mweight, cbqri_get_mweight,
+				   cfg->mweight);
+	mutex_unlock(&ctrl->lock);
+	return ret;
+}
+
 static int cbqri_probe_feature(struct cbqri_controller *ctrl, int reg_offset,
 			       int operation, int *status, bool *access_type_supported)
 {
@@ -323,6 +498,44 @@ static int cbqri_probe_cc(struct cbqri_controller *ctrl)
 	return 0;
 }
 
+static int cbqri_probe_bc(struct cbqri_controller *ctrl)
+{
+	int err, status;
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_BC_CAPABILITIES_OFF);
+	if (reg == 0)
+		return -ENODEV;
+
+	ctrl->ver_minor = FIELD_GET(CBQRI_BC_CAPABILITIES_VER_MINOR_MASK, reg);
+	ctrl->ver_major = FIELD_GET(CBQRI_BC_CAPABILITIES_VER_MAJOR_MASK, reg);
+	ctrl->bc.nbwblks = FIELD_GET(CBQRI_BC_CAPABILITIES_NBWBLKS_MASK, reg);
+	ctrl->bc.mrbwb = FIELD_GET(CBQRI_BC_CAPABILITIES_MRBWB_MASK, reg);
+
+	if (!ctrl->bc.nbwblks) {
+		pr_err("bandwidth controller has nbwblks=0\n");
+		return -EINVAL;
+	}
+
+	pr_debug("version=%d.%d nbwblks=%d mrbwb=%d\n",
+		 ctrl->ver_major, ctrl->ver_minor,
+		 ctrl->bc.nbwblks, ctrl->bc.mrbwb);
+
+	/* Probe allocation features (monitoring not yet implemented) */
+	err = cbqri_probe_feature(ctrl, CBQRI_BC_ALLOC_CTL_OFF,
+				  CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT,
+				  &status, &ctrl->bc.supports_alloc_at_code);
+	if (err)
+		return err;
+
+	if (status == CBQRI_BC_ALLOC_CTL_STATUS_SUCCESS) {
+		ctrl->alloc_capable = true;
+		exposed_alloc_capable = true;
+	}
+
+	return 0;
+}
+
 static int cbqri_probe_controller(struct cbqri_controller *ctrl)
 {
 	int err;
@@ -354,6 +567,9 @@ static int cbqri_probe_controller(struct cbqri_controller *ctrl)
 	switch (ctrl->type) {
 	case CBQRI_CONTROLLER_TYPE_CAPACITY:
 		err = cbqri_probe_cc(ctrl);
+		break;
+	case CBQRI_CONTROLLER_TYPE_BANDWIDTH:
+		err = cbqri_probe_bc(ctrl);
 		break;
 	default:
 		pr_err("unknown controller type %d\n", ctrl->type);
