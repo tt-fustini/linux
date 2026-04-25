@@ -285,6 +285,33 @@ static int cbqri_bc_mon_op(struct cbqri_controller *ctrl, int operation,
 	return 0;
 }
 
+/*
+ * Compute the delta of CBQRI's 62-bit BC counter, handling one
+ * wraparound per call.  Both inputs must already be masked to
+ * CBQRI_BC_MON_CTR_VAL_CTR_MASK.
+ *
+ * Mirrors mbm_overflow_count() in fs/resctrl/monitor.c: shift left
+ * into the high bits so the unsigned 64-bit subtract handles one wrap
+ * correctly, then logical-shift back.
+ *
+ * Unlike x86, no periodic overflow worker is registered.  x86's MBM
+ * counter is 24 bits (MBM_CNTR_WIDTH_BASE) and wraps in ~134 ms at
+ * 100 GB/s, so mbm_handle_overflow() re-reads every
+ * MBM_OVERFLOW_INTERVAL (1 s) to absorb the wraps.  CBQRI's 62-bit
+ * byte counter wraps in ~1.46 years at the same rate, so a single
+ * wrap is already a multi-year horizon and a multi-wrap between
+ * userspace polls is not reachable; the shift-trick math handles
+ * every realistic case unaided and the read path does not consult
+ * the hardware OVF bit.
+ */
+static u64 cbqri_bc_mon_overflow(u64 prev_ctr, u64 cur_ctr)
+{
+	const unsigned int shift = 64 - 62;
+	u64 chunks = (cur_ctr << shift) - (prev_ctr << shift);
+
+	return chunks >> shift;
+}
+
 /* Perform bandwidth allocation control operation on bandwidth controller */
 /* Caller must hold ctrl->lock. */
 static int cbqri_bc_alloc_op(struct cbqri_controller *ctrl, int operation, int rcid)
@@ -944,8 +971,14 @@ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
 
 		ctr_val = ioread64(ctrl->base + CBQRI_CC_MON_CTL_VAL_OFF);
 
-		/* Convert from capacity blocks to bytes */
-		*val = ctr_val * (ctrl->cache.cache_size / ctrl->cc.ncblks);
+		/*
+		 * Convert from capacity blocks to bytes.  Multiply before
+		 * dividing so a non-power-of-2 ncblks does not truncate the
+		 * intermediate result; cache_size and ctr_val both fit in
+		 * u64 with room to spare (cache_size <= a few GiB, ctr_val
+		 * is bounded by ncblks).
+		 */
+		*val = (u64)ctrl->cache.cache_size * ctr_val / ctrl->cc.ncblks;
 out_cc:
 		mutex_unlock(&ctrl->lock);
 		return err;
@@ -965,6 +998,10 @@ out_cc:
 		bc = hw_dom->paired_bc;
 		if (!bc)
 			return -ENOENT;
+		if (WARN_ON_ONCE(!bc->mbm_total_states))
+			return -EIO;
+		if (rmid >= bc->mcid_count)
+			return -ERANGE;
 
 		mutex_lock(&bc->lock);
 		err = cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_READ_COUNTER,
@@ -973,13 +1010,34 @@ out_cc:
 			goto out_bc;
 
 		ctr_val = ioread64(bc->base + CBQRI_BC_MON_CTL_VAL_OFF);
+
 		/*
-		 * CBQRI BC counts in bytes.  INVALID=1 means the counter has
-		 * been (re)configured but no traffic has been observed yet;
-		 * CTR is zero per spec in that case, so masking it off yields
-		 * the correct zero report.
+		 * The hardware OVF bit is sticky -- the spec only clears it
+		 * on CONFIG_EVENT, not on READ_COUNTER -- so consulting it
+		 * here would either flood dmesg after the first ever wrap
+		 * or require a separate "warned" bit to track.  Either way
+		 * the signal is not actionable: see cbqri_bc_mon_overflow()
+		 * for why the 62-bit width makes overflow handling a
+		 * compile-time question rather than a runtime one.
 		 */
-		*val = ctr_val & CBQRI_BC_MON_CTR_VAL_CTR_MASK;
+		if (ctr_val & CBQRI_BC_MON_CTR_VAL_INVALID) {
+			/*
+			 * Counter (re)configured but no traffic observed yet;
+			 * the CTR field is undefined.  Return the existing
+			 * accumulated total (zero just after reset) and do
+			 * not touch prev_ctr -- the next valid read will
+			 * compute its delta from the most recent valid
+			 * snapshot.
+			 */
+			*val = bc->mbm_total_states[rmid].chunks;
+		} else {
+			struct cbqri_bc_mon_state *s = &bc->mbm_total_states[rmid];
+			u64 cur = ctr_val & CBQRI_BC_MON_CTR_VAL_CTR_MASK;
+
+			s->chunks  += cbqri_bc_mon_overflow(s->prev_ctr, cur);
+			s->prev_ctr = cur;
+			*val        = s->chunks;
+		}
 out_bc:
 		mutex_unlock(&bc->lock);
 		return err;
@@ -1009,8 +1067,10 @@ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d
 
 		mutex_lock(&ctrl->lock);
 		/* CONFIG_EVENT with EVT_ID=None stops counting and resets counter */
-		cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
-				rmid, CBQRI_CC_EVT_ID_NONE, NULL);
+		if (cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
+				    rmid, CBQRI_CC_EVT_ID_NONE, NULL))
+			pr_warn_ratelimited("CC@%pa MCID %u: occupancy reset failed\n",
+					    &ctrl->addr, rmid);
 		mutex_unlock(&ctrl->lock);
 		return;
 
@@ -1023,14 +1083,31 @@ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d
 		bc = hw_dom->paired_bc;
 		if (!bc)
 			return;
+		if (WARN_ON_ONCE(!bc->mbm_total_states))
+			return;
+		if (rmid >= bc->mcid_count)
+			return;
 
 		mutex_lock(&bc->lock);
 		/*
 		 * Reconfigure back to TOTAL_READ_WRITE: CBQRI's CONFIG_EVENT
-		 * clears the counter, so this both resets and re-arms.
+		 * clears the hardware counter, so this both resets and
+		 * re-arms.  Zero the matching software accumulator so the
+		 * next read starts fresh.
+		 *
+		 * If CONFIG_EVENT fails (-EIO from a STATUS mismatch, for
+		 * instance) the hardware counter retains its old value X.
+		 * Zeroing the software state would then make the next read
+		 * compute overflow(0, X) = X and inject the entire pre-reset
+		 * counter into the accumulator as phantom traffic.  Skip the
+		 * memset on failure so the accumulator stays consistent with
+		 * the hardware state.
 		 */
-		cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_CONFIG_EVENT,
-				rmid, CBQRI_BC_EVT_ID_TOTAL_READ_WRITE, NULL);
+		if (!cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_CONFIG_EVENT,
+				     rmid, CBQRI_BC_EVT_ID_TOTAL_READ_WRITE,
+				     NULL))
+			memset(&bc->mbm_total_states[rmid], 0,
+			       sizeof(*bc->mbm_total_states));
 		mutex_unlock(&bc->lock);
 		return;
 
