@@ -25,8 +25,8 @@ static bool exposed_cdp_l3_capable;
 static bool is_cdp_l2_enabled;
 static bool is_cdp_l3_enabled;
 
-/* used by resctrl_arch_system_num_rmid_idx() */
-static u32 max_rmid;
+/* used by resctrl_arch_system_num_rmid_idx(); narrowed by cbqri_probe_controller() */
+static u32 max_rmid = U32_MAX;
 
 LIST_HEAD(cbqri_controllers);
 
@@ -645,6 +645,11 @@ bool resctrl_arch_alloc_capable(void)
 	return exposed_alloc_capable;
 }
 
+bool resctrl_arch_mon_capable(void)
+{
+	return exposed_mon_capable;
+}
+
 bool resctrl_arch_get_cdp_enabled(enum resctrl_res_level rid)
 {
 	switch (rid) {
@@ -689,6 +694,65 @@ struct rdt_resource *resctrl_arch_get_resource(enum resctrl_res_level l)
 	return &cbqri_resctrl_resources[l].resctrl_res;
 }
 
+bool resctrl_arch_is_evt_configurable(enum resctrl_event_id evt)
+{
+	return false;
+}
+
+void *resctrl_arch_mon_ctx_alloc(struct rdt_resource *r,
+				 enum resctrl_event_id evtid)
+{
+	/* RISC-V can always read an rmid, nothing needs allocating */
+	return NULL;
+}
+
+void resctrl_arch_mon_ctx_free(struct rdt_resource *r,
+			       enum resctrl_event_id evtid, void *arch_mon_ctx)
+{
+	/* No arch-private monitoring context to free */
+}
+
+void resctrl_arch_config_cntr(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
+			      enum resctrl_event_id evtid, u32 rmid, u32 closid,
+			      u32 cntr_id, bool assign)
+{
+	/* MBM counter assignment not supported */
+}
+
+int resctrl_arch_cntr_read(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
+			   u32 unused, u32 rmid, int cntr_id,
+			   enum resctrl_event_id eventid, u64 *val)
+{
+	/* MBM counter assignment not supported */
+	return -EOPNOTSUPP;
+}
+
+bool resctrl_arch_mbm_cntr_assign_enabled(struct rdt_resource *r)
+{
+	/* MBM counter assignment not supported */
+	return false;
+}
+
+int resctrl_arch_mbm_cntr_assign_set(struct rdt_resource *r, bool enable)
+{
+	/*
+	 * MBM counter assignment is not supported on CBQRI.  Returning 0
+	 * for enable=true would let the resctrl core believe the feature
+	 * was activated even though no hardware change occurred; only
+	 * accept the no-op disable path.
+	 */
+	if (enable)
+		return -EOPNOTSUPP;
+	return 0;
+}
+
+void resctrl_arch_reset_cntr(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
+			     u32 unused, u32 rmid, int cntr_id,
+			     enum resctrl_event_id eventid)
+{
+	/* MBM counter assignment not supported */
+}
+
 bool resctrl_arch_get_io_alloc_enabled(struct rdt_resource *r)
 {
 	/* CBQRI does not have I/O-specific allocation */
@@ -713,6 +777,22 @@ u32 resctrl_arch_get_num_closid(struct rdt_resource *res)
 	hw_res = container_of(res, struct cbqri_resctrl_res, resctrl_res);
 
 	return hw_res->max_rcid;
+}
+
+u32 resctrl_arch_system_num_rmid_idx(void)
+{
+	return max_rmid;
+}
+
+u32 resctrl_arch_rmid_idx_encode(u32 closid, u32 rmid)
+{
+	return rmid;
+}
+
+void resctrl_arch_rmid_idx_decode(u32 idx, u32 *closid, u32 *rmid)
+{
+	*closid = RISCV_RESCTRL_EMPTY_CLOSID;
+	*rmid = idx;
 }
 
 void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid, u32 rmid)
@@ -774,6 +854,101 @@ bool resctrl_arch_match_rmid(struct task_struct *tsk, u32 closid, u32 rmid)
 	tsk_rmid &= SRMCFG_MCID_MASK;
 
 	return tsk_rmid == rmid;
+}
+
+int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
+			   u32 closid, u32 rmid, enum resctrl_event_id eventid,
+			   void *arch_priv, u64 *val, void *arch_mon_ctx)
+{
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	struct rdt_ctrl_domain *d;
+	u64 ctr_val;
+	int err;
+
+	if (eventid != QOS_L3_OCCUP_EVENT_ID)
+		return -EINVAL;
+
+	/*
+	 * The monitoring domain shares the same id as the control domain.
+	 * Find the control domain to get the hw_ctrl pointer.
+	 */
+	d = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+							  hdr->id, NULL);
+	if (!d)
+		return -ENOENT;
+
+	hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+	ctrl = hw_dom->hw_ctrl;
+
+	mutex_lock(&ctrl->lock);
+
+	/*
+	 * All MCIDs are configured with the Occupancy event at init time
+	 * (qos_init_mon_counters). Just snapshot the current value.
+	 */
+	err = cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_READ_COUNTER,
+			      rmid, 0, NULL);
+	if (err)
+		goto out;
+
+	ctr_val = ioread64(ctrl->base + CBQRI_CC_MON_CTL_VAL_OFF);
+
+	/* Convert from capacity blocks to bytes */
+	*val = ctr_val * (ctrl->cache.cache_size / ctrl->cc.ncblks);
+
+out:
+	mutex_unlock(&ctrl->lock);
+	return err;
+}
+
+void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
+			     u32 closid, u32 rmid, enum resctrl_event_id eventid)
+{
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	struct rdt_ctrl_domain *cd;
+
+	if (eventid != QOS_L3_OCCUP_EVENT_ID)
+		return;
+
+	cd = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+							   d->hdr.id, NULL);
+	if (!cd)
+		return;
+
+	hw_dom = container_of(cd, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+	ctrl = hw_dom->hw_ctrl;
+
+	mutex_lock(&ctrl->lock);
+	/* CONFIG_EVENT with EVT_ID=None stops counting and resets counter */
+	cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
+			rmid, CBQRI_CC_EVT_ID_NONE, NULL);
+	mutex_unlock(&ctrl->lock);
+}
+
+void resctrl_arch_mon_event_config_read(void *info)
+{
+	/* Event config not supported */
+}
+
+void resctrl_arch_mon_event_config_write(void *info)
+{
+	/* Event config not supported */
+}
+
+void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_l3_mon_domain *d)
+{
+	int i;
+
+	/*
+	 * resctrl tracks the system-wide minimum mcid_count via max_rmid;
+	 * MCIDs >= max_rmid are not visible to userspace.  Bound the loop
+	 * to that subset so reset_rmid_all matches the index range that
+	 * resctrl_arch_system_num_rmid_idx() advertises.
+	 */
+	for (i = 0; i < max_rmid; i++)
+		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_OCCUP_EVENT_ID);
 }
 
 void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
