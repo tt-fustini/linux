@@ -4,6 +4,7 @@
 #define __LINUX_RISCV_QOS_H
 
 #include <linux/mutex.h>
+#include <linux/resctrl_types.h>
 #include <linux/types.h>
 
 #include <asm/qos.h>
@@ -86,5 +87,24 @@ struct cbqri_controller {
 extern struct list_head cbqri_controllers;
 
 void cbqri_controller_destroy(struct cbqri_controller *ctrl);
+
+bool resctrl_arch_alloc_capable(void);
+
+struct rdt_resource;
+/*
+ * Note about terminology between x86 (Intel RDT/AMD QoS) and RISC-V:
+ *   CLOSID on x86 is RCID on RISC-V
+ *     RMID on x86 is MCID on RISC-V
+ *      CDP on x86 is AT (access type) on RISC-V
+ */
+void resctrl_arch_set_cpu_default_closid_rmid(int cpu, u32 closid, u32 rmid);
+void resctrl_arch_sched_in(struct task_struct *tsk);
+void resctrl_arch_set_closid_rmid(struct task_struct *tsk, u32 closid, u32 rmid);
+bool resctrl_arch_match_closid(struct task_struct *tsk, u32 closid);
+bool resctrl_arch_match_rmid(struct task_struct *tsk, u32 closid, u32 rmid);
+
+/* Not needed for RISC-V */
+static inline void resctrl_arch_enable_alloc(void) { }
+static inline void resctrl_arch_disable_alloc(void) { }
 
 #endif /* __LINUX_RISCV_QOS_H */
