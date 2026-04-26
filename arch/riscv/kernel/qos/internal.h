@@ -107,4 +107,17 @@ struct cbqri_config {
 	u64 mweight; /* opportunistic bandwidth weight (0-255) */
 };
 
+/**
+ * struct cbqri_bc_mon_state - per-MCID software accumulator for BC bandwidth
+ * @prev_ctr: previous 62-bit hardware snapshot (already masked to CTR field)
+ * @chunks:   accumulated 64-bit byte total across hardware wraparounds
+ *
+ * Mirrors x86's struct arch_mbm_state.  Updated in resctrl_arch_rmid_read()
+ * under cbqri_controller::lock and zeroed by resctrl_arch_reset_rmid().
+ */
+struct cbqri_bc_mon_state {
+	u64 prev_ctr;
+	u64 chunks;
+};
+
 #endif /* _ASM_RISCV_QOS_INTERNAL_H */

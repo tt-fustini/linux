@@ -30,6 +30,8 @@ struct riscv_cbqri_bandwidth_caps {
 	bool supports_alloc_at_code;
 };
 
+struct cbqri_bc_mon_state;	/* defined in arch/riscv/kernel/qos/internal.h */
+
 struct cbqri_controller {
 	void __iomem *base;
 	/*
@@ -67,6 +69,16 @@ struct cbqri_controller {
 	enum cbqri_controller_type type;
 	u32 rcid_count;
 	u32 mcid_count;
+
+	/*
+	 * Per-MCID 64-bit software accumulator for the BC's MBM_TOTAL event.
+	 * Allocated by qos_init_bc_mon_counters() when this BC is paired with
+	 * an L3 monitoring domain; sized by ->mcid_count.  NULL on capacity
+	 * controllers and on BCs that are not mon-paired.  Protected by ->lock
+	 * along with the surrounding MMIO sequence.
+	 */
+	struct cbqri_bc_mon_state *mbm_total_states;
+
 	struct list_head list;
 
 	struct cache_controller {

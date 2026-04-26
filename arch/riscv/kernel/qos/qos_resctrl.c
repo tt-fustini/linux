@@ -32,6 +32,7 @@ LIST_HEAD(cbqri_controllers);
 
 void cbqri_controller_destroy(struct cbqri_controller *ctrl)
 {
+	kfree(ctrl->mbm_total_states);
 	kfree(ctrl);
 }
 
@@ -1504,13 +1505,37 @@ static int qos_init_bc_mon_counters(struct cbqri_controller *bc)
 {
 	int i, err;
 
+	/*
+	 * The single mon-capable BC is reachable from every L3 capacity
+	 * controller via cbqri_find_only_mon_bc(), so this initializer
+	 * is called once per L3 CC during qos_resctrl_setup().  Re-entry
+	 * with state already allocated is benign and would just leak.
+	 */
+	if (bc->mbm_total_states)
+		return 0;
+
+	/*
+	 * Per-MCID software accumulator: each entry tracks the previous
+	 * 62-bit hardware snapshot and the running 64-bit byte total.
+	 * Allocated here rather than at probe so that capacity controllers
+	 * and unpaired bandwidth controllers stay at zero footprint.
+	 */
+	bc->mbm_total_states = kcalloc(bc->mcid_count,
+				       sizeof(*bc->mbm_total_states),
+				       GFP_KERNEL);
+	if (!bc->mbm_total_states)
+		return -ENOMEM;
+
 	for (i = 0; i < bc->mcid_count; i++) {
 		mutex_lock(&bc->lock);
 		err = cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_CONFIG_EVENT,
 				      i, CBQRI_BC_EVT_ID_TOTAL_READ_WRITE, NULL);
 		mutex_unlock(&bc->lock);
-		if (err)
+		if (err) {
+			kfree(bc->mbm_total_states);
+			bc->mbm_total_states = NULL;
 			return err;
+		}
 	}
 	return 0;
 }
@@ -1806,6 +1831,8 @@ void qos_resctrl_teardown(void)
 	}
 
 	list_for_each_entry(ctrl, &cbqri_controllers, list) {
+		kfree(ctrl->mbm_total_states);
+		ctrl->mbm_total_states = NULL;
 		if (!ctrl->base)
 			continue;
 		iounmap(ctrl->base);
