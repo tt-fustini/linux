@@ -58,6 +58,46 @@ static void cbqri_set_cbm(struct cbqri_controller *ctrl, u64 cbm)
 	iowrite64(cbm, ctrl->base + CBQRI_CC_BLOCK_MASK_OFF);
 }
 
+/* Set the Rbwb (reserved bandwidth blocks) field in bc_bw_alloc */
+static void cbqri_set_rbwb(struct cbqri_controller *ctrl, u64 rbwb)
+{
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+	reg &= ~CBQRI_CONTROL_REGISTERS_RBWB_MASK;
+	reg |= FIELD_PREP(CBQRI_CONTROL_REGISTERS_RBWB_MASK, rbwb);
+	iowrite64(reg, ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+}
+
+/* Get the Rbwb (reserved bandwidth blocks) field in bc_bw_alloc */
+static u64 cbqri_get_rbwb(struct cbqri_controller *ctrl)
+{
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+	return FIELD_GET(CBQRI_CONTROL_REGISTERS_RBWB_MASK, reg);
+}
+
+/* Set the Mweight (opportunistic weight) field in bc_bw_alloc */
+static void cbqri_set_mweight(struct cbqri_controller *ctrl, u64 mweight)
+{
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+	reg &= ~CBQRI_CONTROL_REGISTERS_MWEIGHT_MASK;
+	reg |= FIELD_PREP(CBQRI_CONTROL_REGISTERS_MWEIGHT_MASK, mweight);
+	iowrite64(reg, ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+}
+
+/* Get the Mweight (opportunistic weight) field in bc_bw_alloc */
+static u64 cbqri_get_mweight(struct cbqri_controller *ctrl)
+{
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_BC_BW_ALLOC_OFF);
+	return FIELD_GET(CBQRI_CONTROL_REGISTERS_MWEIGHT_MASK, reg);
+}
+
 static int cbqri_wait_busy_flag(struct cbqri_controller *ctrl, int reg_offset,
 				u64 *regp)
 {
@@ -233,6 +273,146 @@ out:
 	return err;
 }
 
+/* Perform bandwidth allocation control operation on bandwidth controller */
+/* Caller must hold ctrl->lock. */
+static int cbqri_bc_alloc_op(struct cbqri_controller *ctrl, int operation, int rcid)
+{
+	int reg_offset = CBQRI_BC_ALLOC_CTL_OFF;
+	int status;
+	u64 reg;
+
+	if (ctrl->faulted)
+		return -EIO;
+
+	reg = ioread64(ctrl->base + reg_offset);
+	reg &= ~CBQRI_CONTROL_REGISTERS_OP_MASK;
+	reg |= FIELD_PREP(CBQRI_CONTROL_REGISTERS_OP_MASK, operation);
+	reg &= ~CBQRI_CONTROL_REGISTERS_RCID_MASK;
+	reg |= FIELD_PREP(CBQRI_CONTROL_REGISTERS_RCID_MASK, rcid);
+	iowrite64(reg, ctrl->base + reg_offset);
+
+	if (cbqri_wait_busy_flag(ctrl, reg_offset, &reg) < 0) {
+		pr_err("BUSY timeout during operation\n");
+		return -EIO;
+	}
+
+	status = FIELD_GET(CBQRI_CONTROL_REGISTERS_STATUS_MASK, reg);
+	if (status != CBQRI_BC_ALLOC_CTL_STATUS_SUCCESS) {
+		pr_err("BC alloc op %d failed: status=%d\n",
+		       operation, status);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/*
+ * Write one field (Rbwb or Mweight) of the bc_bw_alloc staging register for
+ * @closid and verify hardware accepted it. bc_bw_alloc packs both fields, so
+ * READ_LIMIT first loads the RCID's current state to preserve the unmodified
+ * field across the subsequent CONFIG_LIMIT.
+ *
+ * Caller must hold ctrl->lock.
+ */
+static int cbqri_apply_bc_field(struct cbqri_resctrl_dom *hw_dom, u32 closid,
+				void (*set)(struct cbqri_controller *, u64),
+				u64 (*get)(struct cbqri_controller *),
+				u64 val)
+{
+	struct cbqri_controller *ctrl = hw_dom->hw_ctrl;
+	int ret;
+	u64 reg;
+
+	/* Load current RCID state so the unmodified field is preserved */
+	ret = cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT, closid);
+	if (ret < 0)
+		return ret;
+
+	set(ctrl, val);
+
+	ret = cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_CONFIG_LIMIT, closid);
+	if (ret < 0)
+		return ret;
+
+	/* Clear field before read-back so a silent READ_LIMIT failure is caught */
+	set(ctrl, 0);
+
+	ret = cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT, closid);
+	if (ret < 0)
+		return ret;
+
+	reg = get(ctrl);
+	if (reg != val) {
+		pr_err("BC field verify mismatch (reg=0x%llx != val=%llu)\n",
+		       reg, val);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+/*
+ * Apply an Rbwb update for @closid, optionally enforcing the CBQRI section
+ * 4.5 invariant sum(Rbwb across all RCIDs) <= MRBWB.  Sum is computed from
+ * ctrl->rbwb_cache rather than re-reading hardware, so the whole sequence
+ * (sum check + write + verify) needs one mutex acquisition and O(1) MMIO
+ * round trips per call regardless of rcid_count.
+ *
+ * @check_sum=false is used by the coordinated init / reset walks where
+ * intermediate sums may transiently exceed MRBWB; the caller guarantees
+ * the final state honours the invariant.
+ */
+static int cbqri_apply_rbwb(struct cbqri_resctrl_dom *hw_dom, u32 closid,
+			    u64 rbwb, bool check_sum)
+{
+	struct cbqri_controller *ctrl = hw_dom->hw_ctrl;
+	u32 i;
+	int ret;
+
+	if (rbwb > U16_MAX)
+		return -EINVAL;
+
+	mutex_lock(&ctrl->lock);
+
+	if (check_sum && rbwb > 0) {
+		u64 sum = rbwb;
+
+		for (i = 0; i < ctrl->rcid_count; i++) {
+			if (i == closid)
+				continue;
+			sum += ctrl->rbwb_cache[i];
+		}
+		if (sum > ctrl->bc.mrbwb) {
+			pr_err("RBWB sum %llu exceeds MRBWB %u\n",
+			       sum, ctrl->bc.mrbwb);
+			ret = -EINVAL;
+			goto out;
+		}
+	}
+
+	ret = cbqri_apply_bc_field(hw_dom, closid,
+				   cbqri_set_rbwb, cbqri_get_rbwb, rbwb);
+	if (!ret)
+		ctrl->rbwb_cache[closid] = rbwb;
+out:
+	mutex_unlock(&ctrl->lock);
+	return ret;
+}
+
+static int cbqri_apply_mweight_config(struct cbqri_resctrl_dom *hw_dom, u32 closid,
+				      struct cbqri_config *cfg)
+{
+	struct cbqri_controller *ctrl = hw_dom->hw_ctrl;
+	int ret;
+
+	mutex_lock(&ctrl->lock);
+	ret = cbqri_apply_bc_field(hw_dom, closid,
+				   cbqri_set_mweight, cbqri_get_mweight,
+				   cfg->mweight);
+	mutex_unlock(&ctrl->lock);
+	return ret;
+}
+
 static int cbqri_probe_feature(struct cbqri_controller *ctrl, int reg_offset,
 			       int operation, int *status, bool *access_type_supported)
 {
@@ -363,6 +543,81 @@ static int cbqri_probe_cc(struct cbqri_controller *ctrl)
 	return 0;
 }
 
+static int cbqri_probe_bc(struct cbqri_controller *ctrl)
+{
+	bool has_mon_at_code = false;
+	int err, status;
+	u64 reg;
+
+	reg = ioread64(ctrl->base + CBQRI_BC_CAPABILITIES_OFF);
+	if (reg == 0)
+		return -ENODEV;
+
+	ctrl->ver_minor = FIELD_GET(CBQRI_BC_CAPABILITIES_VER_MINOR_MASK, reg);
+	ctrl->ver_major = FIELD_GET(CBQRI_BC_CAPABILITIES_VER_MAJOR_MASK, reg);
+	ctrl->bc.nbwblks = FIELD_GET(CBQRI_BC_CAPABILITIES_NBWBLKS_MASK, reg);
+	ctrl->bc.mrbwb = FIELD_GET(CBQRI_BC_CAPABILITIES_MRBWB_MASK, reg);
+
+	if (!ctrl->bc.nbwblks) {
+		pr_err("bandwidth controller has nbwblks=0\n");
+		return -EINVAL;
+	}
+
+	/*
+	 * The reset path in resctrl_arch_reset_all_ctrls() seeds RCID 0's
+	 * Rbwb with mrbwb - (rcid_count - 1), which underflows when mrbwb
+	 * does not cover at least one block per RCID.  Reject such a
+	 * controller at probe so resctrl never sees an inconsistent
+	 * max_bw < min_bw resource.
+	 */
+	if (ctrl->bc.mrbwb < ctrl->rcid_count) {
+		pr_err("bandwidth controller has mrbwb=%u < rcid_count=%u, rejecting\n",
+		       ctrl->bc.mrbwb, ctrl->rcid_count);
+		return -EINVAL;
+	}
+
+	pr_debug("version=%d.%d nbwblks=%d mrbwb=%d\n",
+		 ctrl->ver_major, ctrl->ver_minor,
+		 ctrl->bc.nbwblks, ctrl->bc.mrbwb);
+
+	/* Probe monitoring features */
+	err = cbqri_probe_feature(ctrl, CBQRI_BC_MON_CTL_OFF,
+				  CBQRI_BC_MON_CTL_OP_READ_COUNTER, &status,
+				  &has_mon_at_code);
+	if (err)
+		return err;
+
+	if (status == CBQRI_BC_MON_CTL_STATUS_SUCCESS)
+		ctrl->mon_capable = true;
+
+	/* Probe allocation features */
+	err = cbqri_probe_feature(ctrl, CBQRI_BC_ALLOC_CTL_OFF,
+				  CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT,
+				  &status, &ctrl->bc.supports_alloc_at_code);
+	if (err)
+		return err;
+
+	if (status == CBQRI_BC_ALLOC_CTL_STATUS_SUCCESS) {
+		ctrl->alloc_capable = true;
+		exposed_alloc_capable = true;
+
+		/*
+		 * Allocate the per-RCID Rbwb cache used by cbqri_apply_rbwb()
+		 * to validate sum(Rbwb) <= MRBWB without re-issuing READ_LIMIT
+		 * for every RCID.  Initialised to zero (matches MB_MIN's
+		 * default of min_bw via @default_at_min); the cache is updated
+		 * in lockstep with each successful CONFIG_LIMIT.
+		 */
+		ctrl->rbwb_cache = kcalloc(ctrl->rcid_count,
+					   sizeof(*ctrl->rbwb_cache),
+					   GFP_KERNEL);
+		if (!ctrl->rbwb_cache)
+			return -ENOMEM;
+	}
+
+	return 0;
+}
+
 static int cbqri_probe_controller(struct cbqri_controller *ctrl)
 {
 	int err;
@@ -393,6 +648,9 @@ static int cbqri_probe_controller(struct cbqri_controller *ctrl)
 	switch (ctrl->type) {
 	case CBQRI_CONTROLLER_TYPE_CAPACITY:
 		err = cbqri_probe_cc(ctrl);
+		break;
+	case CBQRI_CONTROLLER_TYPE_BANDWIDTH:
+		err = cbqri_probe_bc(ctrl);
 		break;
 	default:
 		pr_err("unknown controller type %d\n", ctrl->type);
@@ -753,8 +1011,10 @@ void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_l3_mon_domai
 void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
 {
 	struct cbqri_resctrl_res *hw_res;
+	struct cbqri_resctrl_dom *dom;
 	struct rdt_ctrl_domain *d;
 	enum resctrl_conf_type t;
+	struct cbqri_config cfg;
 	u32 default_ctrl;
 	int i;
 
@@ -764,10 +1024,60 @@ void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
 	default_ctrl = resctrl_get_default_ctrl(r);
 
 	list_for_each_entry(d, &r->ctrl_domains, hdr.list) {
-		for (i = 0; i < hw_res->ctrl->rcid_count; i++) {
-			for (t = 0; t < CDP_NUM_TYPES; t++)
-				resctrl_arch_update_one(r, d, i, t,
-							default_ctrl);
+		dom = container_of(d, struct cbqri_resctrl_dom,
+				   resctrl_ctrl_dom);
+		switch (r->rid) {
+		case RDT_RESOURCE_MB_MIN:
+			/*
+			 * CBQRI section 4.5: Rbwb >= 1, sum(Rbwb) <= MRBWB.
+			 * Give RCID 0 the remaining budget after
+			 * reserving 1 block for every other RCID.
+			 *
+			 * Walk RCIDs 1..N-1 down to 1 first, then RCID 0
+			 * last, using the unchecked helper.  The sum check
+			 * cannot be honoured during the walk: RCIDs not yet
+			 * visited still hold their previous values, so the
+			 * intermediate sum may exceed MRBWB even though the
+			 * final state is MRBWB exactly.
+			 */
+			for (i = 0; i < hw_res->ctrl->rcid_count; i++) {
+				u32 rcid = (i + 1) % hw_res->ctrl->rcid_count;
+				int rerr;
+
+				cfg.rbwb = rcid == 0 ?
+					dom->hw_ctrl->bc.mrbwb - (hw_res->ctrl->rcid_count - 1) : 1;
+				rerr = cbqri_apply_rbwb(dom, rcid, cfg.rbwb,
+							false);
+				if (rerr)
+					pr_err_ratelimited("RBWB reset RCID %u failed (%d)\n",
+							   rcid, rerr);
+			}
+			break;
+		case RDT_RESOURCE_MB_WGHT:
+			/*
+			 * Use the same default as new groups get at mkdir
+			 * (resctrl_get_default_ctrl() -> max_bw since Mweight
+			 * has no sum constraint). All RCIDs start at max
+			 * weight, giving equal work-conserving shares; users
+			 * restrict groups by writing a smaller value.
+			 */
+			for (i = 0; i < hw_res->ctrl->rcid_count; i++) {
+				int rerr;
+
+				cfg.mweight = default_ctrl;
+				rerr = cbqri_apply_mweight_config(dom, i, &cfg);
+				if (rerr)
+					pr_err_ratelimited("Mweight reset RCID %u failed (%d)\n",
+							   i, rerr);
+			}
+			break;
+		default:
+			for (i = 0; i < hw_res->ctrl->rcid_count; i++) {
+				for (t = 0; t < CDP_NUM_TYPES; t++)
+					resctrl_arch_update_one(r, d, i, t,
+								default_ctrl);
+			}
+			break;
 		}
 	}
 }
@@ -794,6 +1104,20 @@ int resctrl_arch_update_one(struct rdt_resource *r, struct rdt_ctrl_domain *d,
 	case RDT_RESOURCE_L3:
 		cfg.cbm = cfg_val;
 		err = cbqri_apply_cache_config(dom, closid, t, &cfg);
+		break;
+	case RDT_RESOURCE_MB_MIN:
+		/*
+		 * sum(Rbwb) <= MRBWB validation lives inside cbqri_apply_rbwb()
+		 * so that sum, validate, and apply happen under one mutex
+		 * acquisition; otherwise a concurrent resctrl writer could
+		 * change another RCID's Rbwb between the sum and the apply,
+		 * silently over-allocating.
+		 */
+		err = cbqri_apply_rbwb(dom, closid, cfg_val, true);
+		break;
+	case RDT_RESOURCE_MB_WGHT:
+		cfg.mweight = cfg_val;
+		err = cbqri_apply_mweight_config(dom, closid, &cfg);
 		break;
 	default:
 		return -EINVAL;
@@ -863,6 +1187,24 @@ u32 resctrl_arch_get_config(struct rdt_resource *r, struct rdt_ctrl_domain *d,
 		val = ioread64(ctrl->base + CBQRI_CC_BLOCK_MASK_OFF);
 		break;
 
+	case RDT_RESOURCE_MB_MIN:
+		err = cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT, closid);
+		if (err < 0) {
+			pr_err("operation failed: err=%d\n", err);
+			break;
+		}
+		val = cbqri_get_rbwb(ctrl);
+		break;
+
+	case RDT_RESOURCE_MB_WGHT:
+		err = cbqri_bc_alloc_op(ctrl, CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT, closid);
+		if (err < 0) {
+			pr_err("operation failed: err=%d\n", err);
+			break;
+		}
+		val = cbqri_get_mweight(ctrl);
+		break;
+
 	default:
 		break;
 	}
@@ -894,14 +1236,55 @@ static struct rdt_ctrl_domain *qos_new_domain(struct cbqri_controller *ctrl)
 static int qos_init_domain_ctrlval(struct rdt_resource *r, struct rdt_ctrl_domain *d)
 {
 	struct cbqri_resctrl_res *hw_res;
+	struct cbqri_resctrl_dom *dom;
+	struct cbqri_config cfg;
 	int err = 0;
 	int i;
 
 	hw_res = container_of(r, struct cbqri_resctrl_res, resctrl_res);
+	dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
 
 	for (i = 0; i < hw_res->ctrl->rcid_count; i++) {
-		err = resctrl_arch_update_one(r, d, i, 0,
-					      resctrl_get_default_ctrl(r));
+		/*
+		 * RBWB walks RCIDs 1..N-1 first, then RCID 0 last, so the
+		 * sum is always trending toward (rather than past) MRBWB
+		 * once every RCID has been written.  Other resources do
+		 * not need the reorder, so rcid stays as i for them.
+		 */
+		u32 rcid = (r->rid == RDT_RESOURCE_MB_MIN) ?
+				((i + 1) % hw_res->ctrl->rcid_count) : i;
+
+		switch (r->rid) {
+		case RDT_RESOURCE_MB_MIN:
+			/*
+			 * CBQRI section 4.5: Rbwb >= 1, sum(Rbwb) <= MRBWB.
+			 * RCID 0 gets the remaining budget so the final sum
+			 * equals MRBWB exactly.  Use the unchecked helper:
+			 * during the walk, RCIDs not yet visited may still
+			 * hold stale firmware values that would make the
+			 * intermediate sum check spuriously fail.
+			 */
+			if (rcid == 0)
+				cfg.rbwb = dom->hw_ctrl->bc.mrbwb -
+					   (hw_res->ctrl->rcid_count - 1);
+			else
+				cfg.rbwb = 1;
+			err = cbqri_apply_rbwb(dom, rcid, cfg.rbwb, false);
+			break;
+		case RDT_RESOURCE_MB_WGHT:
+			/*
+			 * Match the new-group default from
+			 * resctrl_get_default_ctrl(): max_bw, giving equal
+			 * work-conserving shares across all RCIDs.
+			 */
+			cfg.mweight = resctrl_get_default_ctrl(r);
+			err = cbqri_apply_mweight_config(dom, i, &cfg);
+			break;
+		default:
+			err = resctrl_arch_update_one(r, d, i, 0,
+						      resctrl_get_default_ctrl(r));
+			break;
+		}
 		if (err)
 			return err;
 	}
@@ -966,6 +1349,41 @@ static int cbqri_resctrl_pick_caches(void)
 }
 
 /*
+ * Walk cbqri_controllers and pick one bandwidth controller (BC) to back
+ * both MB_MIN and MB_WGHT.  These are independent schemata exposed by
+ * the same BC; they share a controller pointer and per-controller domain.
+ * Multiple BCs (e.g. multi-MC SoC) must agree on rcid_count / mrbwb;
+ * mismatch is fatal for the same reason as cbqri_resctrl_pick_caches().
+ */
+static int cbqri_resctrl_pick_bw_alloc(void)
+{
+	struct cbqri_resctrl_res *mn = &cbqri_resctrl_resources[RDT_RESOURCE_MB_MIN];
+	struct cbqri_resctrl_res *mp = &cbqri_resctrl_resources[RDT_RESOURCE_MB_WGHT];
+	struct cbqri_controller *ctrl;
+
+	list_for_each_entry(ctrl, &cbqri_controllers, list) {
+		if (ctrl->type != CBQRI_CONTROLLER_TYPE_BANDWIDTH)
+			continue;
+		if (!ctrl->alloc_capable)
+			continue;
+
+		if (mn->ctrl) {
+			if (mn->ctrl->rcid_count != ctrl->rcid_count ||
+			    mn->ctrl->bc.mrbwb != ctrl->bc.mrbwb) {
+				pr_err("BW controllers have mismatched capabilities\n");
+				return -EINVAL;
+			}
+			continue;
+		}
+
+		mn->ctrl = ctrl;
+		mp->ctrl = ctrl;
+	}
+
+	return 0;
+}
+
+/*
  * Fill the rdt_resource fields for one picked rid.  Mirrors
  * mpam_resctrl_control_init() at drivers/resctrl/mpam_resctrl.c.  An rid
  * with no picked controller is left untouched so it stays out of
@@ -999,6 +1417,61 @@ static int cbqri_resctrl_control_init(struct cbqri_resctrl_res *cbqri_res)
 			resctrl_enable_mon_event(QOS_L3_OCCUP_EVENT_ID,
 						 false, 0, NULL);
 		}
+		break;
+
+	case RDT_RESOURCE_MB_MIN:
+		res->name = "MB_MIN";
+		res->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		/*
+		 * resctrl requires a cache scope for MBA-style domains.
+		 * Use L3 as a proxy until the framework supports non-cache
+		 * scopes for bandwidth resources.
+		 */
+		res->ctrl_scope = RESCTRL_L3_CACHE;
+		/*
+		 * CBQRI Rbwb is an integer block count, not a percentage
+		 * with a linear-delay mapping.  delay_linear /
+		 * arch_needs_linear are the MBA concept and do not apply;
+		 * leave them at their zero-init values so bw_validate()
+		 * does not reject writes.
+		 */
+		res->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
+		res->membw.min_bw = 1;
+		res->membw.max_bw = ctrl->bc.mrbwb;
+		res->membw.bw_gran = 1;
+		/*
+		 * CBQRI section 4.5 caps sum(Rbwb across all RCIDs) at MRBWB.
+		 * Enforcement lives in cbqri_apply_rbwb() (returns -EINVAL on
+		 * overflow under the per-controller mutex, matching the
+		 * existing schemata-write rejection convention).  Default new
+		 * groups to min_bw so mkdir does not overflow the sum; max_bw
+		 * remains the per-group upper bound enforced by bw_validate().
+		 */
+		res->membw.default_at_min = true;
+		break;
+
+	case RDT_RESOURCE_MB_WGHT:
+		res->name = "MB_WGHT";
+		res->schema_fmt = RESCTRL_SCHEMA_RANGE;
+		res->ctrl_scope = RESCTRL_L3_CACHE;
+		/* Mweight is a dimensionless ratio; no delay/linear concept. */
+		res->membw.throttle_mode = THREAD_THROTTLE_UNDEFINED;
+		/*
+		 * CBQRI section 4.5: Mweight is 0-255; 0 disables
+		 * work-conserving, so the group gets only its Rbwb
+		 * reservation with no opportunistic access to unreserved
+		 * or unused bandwidth.  Weights have no sum constraint
+		 * (they are ratios, not a budget).
+		 */
+		res->membw.min_bw = 0;
+		res->membw.max_bw = 255;
+		res->membw.bw_gran = 1;
+		/*
+		 * Equal opportunistic shares across all RCIDs at boot;
+		 * userspace narrows individual groups by writing schemata.
+		 * Leave @default_at_min false so resctrl_get_default_ctrl()
+		 * defaults to @max_bw.
+		 */
 		break;
 
 	default:
@@ -1203,11 +1676,45 @@ static int qos_register_cap_controller(struct cbqri_controller *ctrl)
 	return 0;
 }
 
+/*
+ * Register MB_MIN and MB_WGHT ctrl_domains for a bandwidth controller.
+ * Both schemata share the same hardware controller and proximity domain.
+ */
+static int qos_register_bw_controller(struct cbqri_controller *ctrl)
+{
+	struct cbqri_resctrl_res *res_min, *res_prop;
+	struct rdt_ctrl_domain *dom_min = NULL, *dom_prop = NULL;
+	int err;
+
+	if (!ctrl->alloc_capable)
+		return 0;
+
+	res_min = &cbqri_resctrl_resources[RDT_RESOURCE_MB_MIN];
+	err = qos_register_ctrl_domain(ctrl, &res_min->resctrl_res,
+				       &ctrl->mem.cpu_mask,
+				       ctrl->mem.prox_dom, &dom_min);
+	if (err)
+		return err;
+
+	res_prop = &cbqri_resctrl_resources[RDT_RESOURCE_MB_WGHT];
+	err = qos_register_ctrl_domain(ctrl, &res_prop->resctrl_res,
+				       &ctrl->mem.cpu_mask,
+				       ctrl->mem.prox_dom, &dom_prop);
+	if (err) {
+		qos_unregister_ctrl_domain(&res_min->resctrl_res, dom_min);
+		return err;
+	}
+
+	return 0;
+}
+
 static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl)
 {
 	switch (ctrl->type) {
 	case CBQRI_CONTROLLER_TYPE_CAPACITY:
 		return qos_register_cap_controller(ctrl);
+	case CBQRI_CONTROLLER_TYPE_BANDWIDTH:
+		return qos_register_bw_controller(ctrl);
 	default:
 		pr_err("unknown controller type %d\n", ctrl->type);
 		return -ENODEV;
@@ -1314,6 +1821,9 @@ int qos_resctrl_setup(void)
 	 * error -- resctrl exposes one set of caps per rid.
 	 */
 	err = cbqri_resctrl_pick_caches();
+	if (err)
+		goto err_free_controllers_list;
+	err = cbqri_resctrl_pick_bw_alloc();
 	if (err)
 		goto err_free_controllers_list;
 
@@ -1484,6 +1994,7 @@ device_initcall_sync(__cacheinfo_ready);
 
 void cbqri_controller_destroy(struct cbqri_controller *ctrl)
 {
+	kfree(ctrl->rbwb_cache);
 	kfree(ctrl);
 }
 
