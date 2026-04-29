@@ -22980,6 +22980,8 @@ S:	Supported
 F:	arch/riscv/include/asm/qos.h
 F:	arch/riscv/include/asm/resctrl.h
 F:	arch/riscv/kernel/qos.c
+F:	drivers/acpi/riscv/rqsc.c
+F:	drivers/acpi/riscv/rqsc.h
 F:	drivers/resctrl/cbqri_internal.h
 F:	drivers/resctrl/cbqri_resctrl.c
 F:	include/linux/cbqri.h

@@ -2319,6 +2319,30 @@ void cbqri_controller_destroy(struct cbqri_controller *ctrl)
 }
 
 /*
+ * Roll back the most recent @n successful riscv_cbqri_register_controller()
+ * calls.  Discovery layers use this to undo partial registrations when a
+ * subsequent table entry turns out to be malformed and the whole parse must
+ * abort -- so qos_arch_late_init() does not see a half-built topology.
+ *
+ * Caller serialisation: this is intended for boot-time discovery (ACPI
+ * acpi_arch_init, future DT) which run single-threaded before late_initcall;
+ * no lock is taken.
+ */
+void riscv_cbqri_unregister_last(unsigned int n)
+{
+	while (n--) {
+		struct cbqri_controller *ctrl;
+
+		if (list_empty(&cbqri_controllers))
+			return;
+		ctrl = list_last_entry(&cbqri_controllers,
+				       struct cbqri_controller, list);
+		list_del(&ctrl->list);
+		cbqri_controller_destroy(ctrl);
+	}
+}
+
+/*
  * Allocate, populate, and add to cbqri_controllers a fresh controller
  * descriptor based on @info supplied by a discovery layer (ACPI RQSC,
  * future DT).  Resolves the cpumask via PPTT (capacity) or NUMA proximity

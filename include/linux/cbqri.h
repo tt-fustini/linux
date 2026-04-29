@@ -42,12 +42,15 @@ struct cbqri_controller_info {
 
 #if IS_ENABLED(CONFIG_RISCV_CBQRI_DRIVER)
 int riscv_cbqri_register_controller(const struct cbqri_controller_info *info);
+void riscv_cbqri_unregister_last(unsigned int n);
 #else
 static inline int
 riscv_cbqri_register_controller(const struct cbqri_controller_info *info)
 {
 	return -ENODEV;
 }
+
+static inline void riscv_cbqri_unregister_last(unsigned int n) { }
 #endif
 
 #endif /* _LINUX_CBQRI_H */
