@@ -983,6 +983,140 @@ is formatted as:
 
 	SMBA:<cache_id0>=bandwidth0;<cache_id1>=bandwidth1;...
 
+Memory bandwidth reservation (MB_MIN) and weight (MB_WGHT)
+------------------------------------------------------------
+Some platforms expose bandwidth controllers with reservation and
+weighted-share semantics in addition to (or instead of) the
+percentage-cap MBA model. RISC-V platforms implementing the CBQRI
+(Capacity and Bandwidth QoS Register Interface) specification present
+their controllers' Reserved Bandwidth Blocks (Rbwb) and Mweight fields
+through these two schemata resources. ARM MPAM defines two register
+fields with the same semantics - ``MBW_MIN`` (per-PARTID minimum
+bandwidth reservation, the analogue of ``MB_MIN``) and ``MBW_PROP``
+(proportional weight, the analogue of ``MB_WGHT``) - so a future MPAM
+driver can map its hardware fields onto these resctrl resource ids.
+
+``MB_MIN`` - per-group bandwidth reservation
+  Each group's value is the number of bandwidth blocks guaranteed to
+  its CLOSID. On CBQRI hardware these correspond to the Rbwb field
+  defined in CBQRI section 4.5. Unlike MBA percentages, MB_MIN values
+  have a hard cross-group constraint::
+
+	sum(MB_MIN across all CLOSIDs in a domain) <= controller budget
+
+  The controller budget (MRBWB on CBQRI hardware) is both the per-group
+  ceiling and the domain-wide budget. ``min_bandwidth = 1`` and
+  ``bandwidth_gran = 1`` are exposed in ``info/MB_MIN/``. A schemata
+  write that would push the sum past the budget returns ``-EINVAL``.
+  The per-controller mutex serializes the read-sum-check-write
+  sequence so concurrent writers cannot collectively exceed the
+  budget. All CLOSIDs are pre-seeded to ``min_bandwidth`` at domain
+  creation, so ``mkdir`` does not itself raise the sum.
+
+  Schemata format::
+
+	MB_MIN:<dom_id0>=<blocks0>;<dom_id1>=<blocks1>;...
+
+``MB_WGHT`` - opportunistic bandwidth weight
+  Controls how unreserved and unused bandwidth is distributed during
+  contention. A group's share of the leftover pool is proportional to
+  its weight. On CBQRI hardware this corresponds to the Mweight field
+  in section 4.5. A value of ``0`` disables work-conserving behavior
+  for that group (hard cap at the group's MB_MIN reservation).
+  Non-zero values (1-255) compete for the leftover pool. There is no
+  sum constraint on MB_WGHT. Default value is ``255`` (equal
+  opportunistic shares).
+
+  Schemata format::
+
+	MB_WGHT:<dom_id0>=<weight0>;<dom_id1>=<weight1>;...
+
+MB_MIN and MB_WGHT are independent resources: writing one does not
+alter the other. The ``mba_MBps`` mount option applies only to the MBA
+resource (which requires L3 monitoring and a linear MBA scale). It has
+no effect on MB_MIN or MB_WGHT. On systems that expose MB_MIN /
+MB_WGHT but not MBA, mounting with ``-o mba_MBps`` is rejected with
+``-EINVAL``. Mounting without that option succeeds and exposes the
+MB_MIN / MB_WGHT schemata normally.
+
+Info files for MB_MIN and MB_WGHT reuse the generic memory-bandwidth
+set (the same files exposed for MBA and SMBA):
+
+``info/MB_MIN/min_bandwidth``
+  Minimum MB_MIN value a group may be configured with. Fixed at ``1``
+  (zero is reserved because it would deassert the CLOSID's reservation
+  and is disallowed by CBQRI section 4.5 for active groups).
+
+``info/MB_MIN/bandwidth_gran``
+  Granularity of an MB_MIN write. Always ``1``: values are integer
+  block counts.
+
+``info/MB_MIN/delay_linear``
+  Always ``0``. MB_MIN is an integer block reservation, not a throttle
+  percentage, so the MBA linear-delay concept does not apply. The file
+  is retained for interface uniformity with MBA/SMBA.
+
+``info/MB_WGHT/min_bandwidth``
+  Minimum MB_WGHT value. Fixed at ``0``. ``0`` is a valid weight that
+  opts the group out of work-conserving sharing.
+
+``info/MB_WGHT/bandwidth_gran``
+  Always ``1``: MB_WGHT is an integer in [0, 255].
+
+``info/MB_WGHT/delay_linear``
+  Always ``0``. MB_WGHT is a dimensionless ratio. The MBA linear-delay
+  concept does not apply. The file is retained for interface
+  uniformity with MBA/SMBA.
+
+CBQRI bandwidth monitoring (L3 ``mbm_total_bytes``)
+---------------------------------------------------
+On RISC-V platforms where a CBQRI bandwidth controller (BC) shares
+topology with an L3 cache controller (same set of CPUs per PPTT/RQSC),
+the BC's per-MCID bandwidth counter is exposed through the L3
+monitoring domain as the ``mbm_total_bytes`` event. No separate
+memory-controller monitoring resource is added. The BC's counter
+backs the existing ``QOS_L3_MBM_TOTAL_EVENT_ID`` so that
+``/sys/fs/resctrl/mon_data/mon_L3_<id>/mbm_total_bytes`` reports
+accumulated read+write bytes attributable to each resctrl group's
+MCID. This mirrors the approach taken by the ARM MPAM driver for
+memory-system MSCs that do not sit on an Intel-style L3.
+
+Implications for userspace:
+
+* ``info/L3_MON/mon_features`` advertises ``mbm_total_bytes`` only.
+  ``mbm_local_bytes`` is not advertised: the BC sits on a single
+  memory controller and cannot attribute reads by destination NUMA
+  node, so a "local" event would be indistinguishable from total and
+  mislead userspace. The driver omits ``QOS_L3_MBM_LOCAL_EVENT_ID``
+  from the resource's ``mon_features`` bitmask. The framework does
+  not enforce this, the driver decides.
+
+* The ``mon_L3_<id>`` domain id is the L3 cache id (from PPTT) even
+  when the counter physically lives on a BC whose RQSC proximity
+  domain resolves to the same set of online CPUs. Reads follow the
+  paired BC automatically. Userspace sees a single domain id for the
+  combined cache-occupancy + memory-bandwidth view.
+
+* mbm_total_bytes is advertised only when the platform exposes exactly one
+  mon-capable CBQRI bandwidth controller. That single BC is paired
+  with every L3 monitoring domain, on the assumption that all memory
+  traffic observed at any LLC must flow through the one memory
+  controller. On platforms with zero BCs, or with two or more
+  mon-capable BCs, no ``mbm_total_bytes`` file appears: with multiple
+  BCs there is no honest way to attribute an L3's traffic to a single
+  counter without per-BC scope support in resctrl, which does not yet
+  exist. Tightening this when resctrl gains memory-controller scope
+  is a follow-up.
+
+* Monitor-only CBQRI capacity controllers (``mcid_count > 0``,
+  ``rcid_count == 0``, legal per CBQRI section 4.2) currently produce
+  no ``mon_L3_<id>`` directory. The CBQRI driver's mon_domain attach
+  path is wired through ``qos_register_ctrl_domain()``, which gates on
+  ``alloc_capable``. Lifting this limitation needs a fs/resctrl change
+  that lets an L3 mon_domain register without a paired ctrl_domain.
+  Until then the driver emits a ``pr_warn_once()`` so the missing
+  directory is discoverable from dmesg.
+
 Reading/writing the schemata file
 ---------------------------------
 Reading the schemata file will show the state of all resources
