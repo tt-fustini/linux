@@ -18,12 +18,17 @@
 #define CBQRI_CC_ALLOC_CTL_OFF   24
 #define CBQRI_CC_BLOCK_MASK_OFF  32
 
+#define CBQRI_BC_CAPABILITIES_OFF 0
+#define CBQRI_BC_MON_CTL_OFF      8
+#define CBQRI_BC_ALLOC_CTL_OFF   24
+#define CBQRI_BC_BW_ALLOC_OFF    32
+
 /*
  * Smallest MMIO span the driver actually accesses: highest defined
  * register offset (0x20) plus the 8-byte register width.  Used by
  * cbqri_probe_controller() to reject undersized firmware-supplied
  * mappings before request_mem_region/ioremap, so a u64 access at
- * BLOCK_MASK does not walk past the end of the mapping.
+ * BLOCK_MASK / BW_ALLOC does not walk past the end of the mapping.
  */
 #define CBQRI_CTRL_MIN_REG_SPAN  0x28u
 
@@ -32,6 +37,12 @@
 
 #define CBQRI_CC_CAPABILITIES_NCBLKS_MASK  GENMASK(23, 8)
 
+#define CBQRI_BC_CAPABILITIES_VER_MINOR_MASK  GENMASK(3, 0)
+#define CBQRI_BC_CAPABILITIES_VER_MAJOR_MASK  GENMASK(7, 4)
+
+#define CBQRI_BC_CAPABILITIES_NBWBLKS_MASK  GENMASK(23, 8)
+#define CBQRI_BC_CAPABILITIES_MRBWB_MASK    GENMASK_ULL(47, 32)
+
 #define CBQRI_CONTROL_REGISTERS_OP_MASK      GENMASK(4, 0)
 #define CBQRI_CONTROL_REGISTERS_AT_MASK      GENMASK(7, 5)
 #define CBQRI_CONTROL_REGISTERS_AT_DATA      0
@@ -39,14 +50,28 @@
 #define CBQRI_CONTROL_REGISTERS_RCID_MASK    GENMASK(19, 8)
 #define CBQRI_CONTROL_REGISTERS_STATUS_MASK  GENMASK_ULL(38, 32)
 #define CBQRI_CONTROL_REGISTERS_BUSY_MASK    GENMASK_ULL(39, 39)
+#define CBQRI_CONTROL_REGISTERS_RBWB_MASK    GENMASK(15, 0)
+#define CBQRI_CONTROL_REGISTERS_MWEIGHT_MASK GENMASK(27, 20)
 
 #define CBQRI_CC_ALLOC_CTL_OP_CONFIG_LIMIT 1
 #define CBQRI_CC_ALLOC_CTL_OP_READ_LIMIT   2
 #define CBQRI_CC_ALLOC_CTL_STATUS_SUCCESS  1
 
+#define CBQRI_BC_ALLOC_CTL_OP_CONFIG_LIMIT 1
+#define CBQRI_BC_ALLOC_CTL_OP_READ_LIMIT   2
+#define CBQRI_BC_ALLOC_CTL_STATUS_SUCCESS  1
+
 #define CBQRI_CC_MON_CTL_OP_CONFIG_EVENT 1
 #define CBQRI_CC_MON_CTL_OP_READ_COUNTER 2
 #define CBQRI_CC_MON_CTL_STATUS_SUCCESS  1
+
+/*
+ * bc_mon_ctl op and status used during probe to detect monitoring support.
+ * The full monitoring path (CONFIG_EVENT, READ_COUNTER on a real RMID) is
+ * added by the bandwidth monitoring patch.
+ */
+#define CBQRI_BC_MON_CTL_OP_READ_COUNTER 2
+#define CBQRI_BC_MON_CTL_STATUS_SUCCESS  1
 
 /* cc_mon_ctl / bc_mon_ctl field masks (same layout as alloc_ctl plus EVT_ID) */
 #define CBQRI_MON_CTL_OP_MASK        GENMASK(4, 0)
@@ -61,6 +86,14 @@
 /* Capacity Controller hardware capabilities */
 struct riscv_cbqri_capacity_caps {
 	u16 ncblks; /* number of capacity blocks */
+
+	bool supports_alloc_at_code;
+};
+
+/* Bandwidth Controller hardware capabilities */
+struct riscv_cbqri_bandwidth_caps {
+	u16 nbwblks; /* number of bandwidth blocks */
+	u16 mrbwb;   /* max reserved bw blocks */
 
 	bool supports_alloc_at_code;
 };
@@ -91,6 +124,7 @@ struct cbqri_controller {
 	int ver_major;
 	int ver_minor;
 
+	struct riscv_cbqri_bandwidth_caps bc;
 	struct riscv_cbqri_capacity_caps cc;
 
 	bool alloc_capable;
@@ -101,6 +135,16 @@ struct cbqri_controller {
 	enum cbqri_controller_type type;
 	u32 rcid_count;
 	u32 mcid_count;
+
+	/*
+	 * Per-RCID cache of the most recent Rbwb value applied via
+	 * CONFIG_LIMIT.  Lets cbqri_apply_rbwb() validate the
+	 * sum(Rbwb) <= MRBWB invariant in O(rcid_count) memory accesses
+	 * instead of O(rcid_count) READ_LIMIT round trips, each of which
+	 * spends up to 1 ms in cbqri_wait_busy_flag() under ->lock.
+	 * Allocated by cbqri_probe_bc(); NULL on capacity controllers.
+	 */
+	u16 *rbwb_cache;
 
 	struct list_head list;
 
@@ -146,10 +190,6 @@ struct cbqri_resctrl_res {
 struct cbqri_resctrl_dom {
 	struct rdt_ctrl_domain  resctrl_ctrl_dom;
 	struct cbqri_controller *hw_ctrl;
-};
-
-struct cbqri_config {
-	u64 cbm; /* capacity block mask */
 };
 
 #endif /* _DRIVERS_RESCTRL_CBQRI_INTERNAL_H */
