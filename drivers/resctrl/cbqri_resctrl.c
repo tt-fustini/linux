@@ -170,6 +170,40 @@ static int cbqri_cc_alloc_op(struct cbqri_controller *ctrl, int operation, int r
 }
 
 /*
+ * Perform capacity usage monitoring operation on capacity controller.
+ * Caller must hold ctrl->lock.
+ */
+static int cbqri_cc_mon_op(struct cbqri_controller *ctrl, int operation,
+			   int mcid, int evt_id, u64 *out_reg)
+{
+	u64 reg;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	if (ctrl->faulted)
+		return -EIO;
+
+	reg = FIELD_PREP(CBQRI_MON_CTL_OP_MASK, operation) |
+	      FIELD_PREP(CBQRI_MON_CTL_MCID_MASK, mcid) |
+	      FIELD_PREP(CBQRI_MON_CTL_EVT_ID_MASK, evt_id);
+	iowrite64(reg, ctrl->base + CBQRI_CC_MON_CTL_OFF);
+
+	if (cbqri_wait_busy_flag(ctrl, CBQRI_CC_MON_CTL_OFF, &reg) < 0) {
+		pr_err("BUSY timeout\n");
+		return -EIO;
+	}
+
+	if (FIELD_GET(CBQRI_MON_CTL_STATUS_MASK, reg) !=
+	    CBQRI_CC_MON_CTL_STATUS_SUCCESS)
+		return -EIO;
+
+	if (out_reg)
+		*out_reg = reg;
+
+	return 0;
+}
+
+/*
  * Write a capacity block mask and verify the hardware accepted it by
  * reading back the value after a CONFIG_LIMIT + READ_LIMIT sequence.
  *
@@ -397,8 +431,21 @@ static int cbqri_probe_cc(struct cbqri_controller *ctrl)
 	if (err)
 		return err;
 
-	if (status == CBQRI_CC_MON_CTL_STATUS_SUCCESS)
-		ctrl->mon_capable = true;
+	if (status == CBQRI_CC_MON_CTL_STATUS_SUCCESS) {
+		/*
+		 * Occupancy is reported to userspace in bytes, computed
+		 * as cache_size * counter / ncblks (see
+		 * resctrl_arch_rmid_read()).  If PPTT did not give us a
+		 * cache_size, leave mon_capable=false so the file is not
+		 * exposed at all rather than silently returning 0.
+		 */
+		if (!ctrl->cache.cache_size) {
+			pr_warn("CC @%pa: cache_size unknown, occupancy monitoring disabled\n",
+				&ctrl->addr);
+		} else {
+			ctrl->mon_capable = true;
+		}
+	}
 
 	/* Probe allocation features */
 	err = cbqri_probe_feature(ctrl, CBQRI_CC_ALLOC_CTL_OFF,
@@ -695,14 +742,111 @@ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
 			   u32 closid, u32 rmid, enum resctrl_event_id eventid,
 			   void *arch_priv, u64 *val, void *arch_mon_ctx)
 {
-	/* No monitoring events backed in scaffolding; added per-feature later. */
-	return -EINVAL;
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	struct rdt_ctrl_domain *d;
+	u64 ctr_val;
+	int err;
+
+	resctrl_arch_rmid_read_context_check();
+
+	/*
+	 * Each event-id branch takes a sleeping mutex on the owning
+	 * controller (1-ms busy-wait per CBQRI op).  Honour the
+	 * resctrl_arch_rmid_read() contract: if irqs are disabled (e.g.
+	 * smp_call_function_any() from mon_event_read() on nohz_full)
+	 * we cannot sleep, so fail fast and let the caller fall back.
+	 */
+	if (irqs_disabled())
+		return -EIO;
+
+	switch (eventid) {
+	case QOS_L3_OCCUP_EVENT_ID:
+		/*
+		 * The monitoring domain shares the same id as the control
+		 * domain.  Find the control domain to get the hw_ctrl pointer.
+		 */
+		d = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+								  hdr->id, NULL);
+		if (!d)
+			return -ENOENT;
+
+		hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		ctrl = hw_dom->hw_ctrl;
+
+		mutex_lock(&ctrl->lock);
+
+		/*
+		 * Each MCID is armed with the Occupancy event at init
+		 * (qos_init_mon_counters) and re-armed by
+		 * resctrl_arch_reset_rmid() on RMID recycle.  Pass
+		 * EVT_ID=Occupancy so READ_COUNTER's EVT_ID field matches
+		 * the configured event rather than relying on
+		 * sticky-last-configured-event semantics that the CBQRI
+		 * register definition does not guarantee.
+		 */
+		err = cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_READ_COUNTER,
+				      rmid, CBQRI_CC_EVT_ID_OCCUPANCY, NULL);
+		if (err)
+			goto out_cc;
+
+		ctr_val = ioread64(ctrl->base + CBQRI_CC_MON_CTL_VAL_OFF);
+
+		/*
+		 * Convert from capacity blocks to bytes.  Multiply before
+		 * dividing so a non-power-of-2 ncblks does not truncate the
+		 * intermediate result; cache_size and ctr_val both fit in
+		 * u64 with room to spare (cache_size <= a few GiB, ctr_val
+		 * is bounded by ncblks).
+		 */
+		*val = (u64)ctrl->cache.cache_size * ctr_val / ctrl->cc.ncblks;
+out_cc:
+		mutex_unlock(&ctrl->lock);
+		return err;
+
+	default:
+		return -EINVAL;
+	}
 }
 
 void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
 			     u32 closid, u32 rmid, enum resctrl_event_id eventid)
 {
-	/* No monitoring events backed in scaffolding; added per-feature later. */
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	struct rdt_ctrl_domain *cd;
+
+	switch (eventid) {
+	case QOS_L3_OCCUP_EVENT_ID:
+		cd = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+								   d->hdr.id, NULL);
+		if (!cd)
+			return;
+
+		hw_dom = container_of(cd, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		ctrl = hw_dom->hw_ctrl;
+
+		mutex_lock(&ctrl->lock);
+		/*
+		 * Re-arm CONFIG_EVENT with EVT_ID=OCCUPANCY (rather than
+		 * EVT_ID=None) to zero the counter while keeping the MCID
+		 * counting.  resctrl invokes this on RMID recycle when the
+		 * MCID is reassigned to a new monitoring group; if we cleared
+		 * the event configuration, qos_init_mon_counters() (which
+		 * runs once at domain online) would not re-arm and the new
+		 * group's resctrl_arch_rmid_read() would observe a stuck
+		 * zero forever.
+		 */
+		if (cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
+				    rmid, CBQRI_CC_EVT_ID_OCCUPANCY, NULL))
+			pr_warn_ratelimited("CC@%pa MCID %u: occupancy reset failed\n",
+					    &ctrl->addr, rmid);
+		mutex_unlock(&ctrl->lock);
+		return;
+
+	default:
+		return;
+	}
 }
 
 void resctrl_arch_mon_event_config_read(void *info)
@@ -717,7 +861,11 @@ void resctrl_arch_mon_event_config_write(void *info)
 
 void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_l3_mon_domain *d)
 {
-	/* No monitoring events backed in scaffolding; added per-feature later. */
+	int i;
+
+	/* Bound by max_rmid (system-wide minimum mcid_count). */
+	for (i = 0; i < max_rmid; i++)
+		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_OCCUP_EVENT_ID);
 }
 
 void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
@@ -987,6 +1135,19 @@ static int cbqri_resctrl_control_init(struct cbqri_resctrl_res *cbqri_res)
 		 * not reserve the 4 chars for the :CODE / :DATA suffix.
 		 */
 		res->cdp_capable = ctrl->cc.supports_alloc_at_code;
+
+		if (ctrl->mon_capable && res->rid == RDT_RESOURCE_L3) {
+			res->mon_scope = RESCTRL_L3_CACHE;
+			res->mon.num_rmid = ctrl->mcid_count;
+			resctrl_enable_mon_event(QOS_L3_OCCUP_EVENT_ID,
+						 false, 0, NULL);
+
+			/*
+			 * Set mon_capable last so a partial init never leaves
+			 * the resource visible to userspace as "ready".
+			 */
+			res->mon_capable = true;
+		}
 		break;
 
 	default:
@@ -1000,6 +1161,21 @@ static int cbqri_resctrl_control_init(struct cbqri_resctrl_res *cbqri_res)
 	 */
 	res->alloc_capable = ctrl->alloc_capable;
 
+	return 0;
+}
+
+static int qos_init_mon_counters(struct cbqri_controller *ctrl)
+{
+	int i, err;
+
+	for (i = 0; i < ctrl->mcid_count; i++) {
+		mutex_lock(&ctrl->lock);
+		err = cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
+				      i, CBQRI_CC_EVT_ID_OCCUPANCY, NULL);
+		mutex_unlock(&ctrl->lock);
+		if (err)
+			return err;
+	}
 	return 0;
 }
 
@@ -1055,15 +1231,84 @@ err_free:
 	return err;
 }
 
+static void qos_unregister_ctrl_domain(struct rdt_resource *res,
+				       struct rdt_ctrl_domain *domain)
+{
+	resctrl_offline_ctrl_domain(res, domain);
+	list_del(&domain->hdr.list);
+	kfree(container_of(domain, struct cbqri_resctrl_dom, resctrl_ctrl_dom));
+}
+
+/*
+ * Allocate, list-insert, and online an L3 monitoring domain backing @ctrl,
+ * then arm every MCID with the occupancy event.
+ */
+static int qos_attach_l3_mon_domain(struct cbqri_controller *ctrl,
+				    struct rdt_resource *res,
+				    struct rdt_ctrl_domain *ctrl_dom)
+{
+	struct list_head *mon_pos = NULL;
+	struct rdt_l3_mon_domain *mon_dom;
+	int err;
+
+	mon_dom = kzalloc_obj(*mon_dom, GFP_KERNEL);
+	if (!mon_dom)
+		return -ENOMEM;
+
+	mon_dom->hdr.id = ctrl_dom->hdr.id;
+	mon_dom->hdr.type = RESCTRL_MON_DOMAIN;
+	mon_dom->hdr.rid = RDT_RESOURCE_L3;
+	cpumask_copy(&mon_dom->hdr.cpu_mask, &ctrl->cache.cpu_mask);
+	INIT_LIST_HEAD(&mon_dom->hdr.list);
+
+	/*
+	 * Reject duplicate domain ids: two L3 capacity controllers sharing a
+	 * cache_id would otherwise leave two entries on res->mon_domains
+	 * with the same id, causing resctrl_offline_mon_domain() to be
+	 * called twice during teardown.  Mirrors the ctrl_domain check in
+	 * qos_register_ctrl_domain().
+	 */
+	if (resctrl_find_domain(&res->mon_domains, mon_dom->hdr.id, &mon_pos)) {
+		pr_err("duplicate L3 mon domain id %d\n", mon_dom->hdr.id);
+		err = -EEXIST;
+		goto err_free;
+	}
+	if (mon_pos)
+		list_add_tail(&mon_dom->hdr.list, mon_pos);
+	else
+		list_add_tail(&mon_dom->hdr.list, &res->mon_domains);
+
+	err = resctrl_online_mon_domain(res, &mon_dom->hdr);
+	if (err)
+		goto err_listdel;
+
+	err = qos_init_mon_counters(ctrl);
+	if (err) {
+		resctrl_offline_mon_domain(res, &mon_dom->hdr);
+		goto err_listdel;
+	}
+
+	return 0;
+
+err_listdel:
+	list_del(&mon_dom->hdr.list);
+err_free:
+	kfree(mon_dom);
+	return err;
+}
+
 /*
  * Register one rdt_ctrl_domain on the resctrl resource backing @rid for
- * a capacity controller @ctrl.
+ * a capacity controller @ctrl, plus the L3 monitoring domain when @ctrl
+ * is mon_capable.
  */
 static int qos_register_cap_controller(struct cbqri_controller *ctrl)
 {
 	struct cbqri_resctrl_res *cbqri_res;
+	struct rdt_ctrl_domain *domain = NULL;
 	struct rdt_resource *res;
 	enum resctrl_res_level rid;
+	int err;
 
 	/*
 	 * Monitor-only CCs (mcid_count > 0, rcid_count == 0) are not
@@ -1097,8 +1342,20 @@ static int qos_register_cap_controller(struct cbqri_controller *ctrl)
 	cbqri_res = &cbqri_resctrl_resources[rid];
 	res = &cbqri_res->resctrl_res;
 
-	return qos_register_ctrl_domain(ctrl, res, &ctrl->cache.cpu_mask,
-					ctrl->cache.cache_id, NULL);
+	err = qos_register_ctrl_domain(ctrl, res, &ctrl->cache.cpu_mask,
+				       ctrl->cache.cache_id, &domain);
+	if (err)
+		return err;
+
+	if (ctrl->mon_capable && ctrl->cache.cache_level == 3) {
+		err = qos_attach_l3_mon_domain(ctrl, res, domain);
+		if (err) {
+			qos_unregister_ctrl_domain(res, domain);
+			return err;
+		}
+	}
+
+	return 0;
 }
 
 static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl)
@@ -1134,7 +1391,38 @@ void qos_resctrl_teardown(void)
 	enum resctrl_res_level rid;
 
 	for (rid = 0; rid < RDT_NUM_RESOURCES; rid++) {
+		struct rdt_l3_mon_domain *mon_d, *mon_tmp;
+
 		res = &cbqri_resctrl_resources[rid];
+		list_for_each_entry_safe(mon_d, mon_tmp,
+					 &res->resctrl_res.mon_domains, hdr.list) {
+			/*
+			 * Drain cqm_limbo / mbm_over delayed work before
+			 * fs/resctrl frees the per-domain state these
+			 * workers dereference (rmid_busy_llc, mbm_states).
+			 *
+			 * resctrl_offline_mon_domain() uses
+			 * cancel_delayed_work() (not _sync) internally.
+			 * If a worker is already executing and blocked on
+			 * rdtgroup_mutex (taken at the top of
+			 * cqm_handle_limbo()/mbm_handle_overflow()), the
+			 * cancel returns false, fs/resctrl drops the mutex
+			 * and frees the per-domain state, and the worker
+			 * then re-acquires the mutex and dereferences the
+			 * freed memory before this loop kfree()s mon_d.
+			 *
+			 * Calling cancel_delayed_work_sync() here, outside
+			 * any lock, makes the worker exit (or removes it
+			 * from the queue) before either fs/resctrl or this
+			 * driver tears the domain down.
+			 */
+			cancel_delayed_work_sync(&mon_d->cqm_limbo);
+			cancel_delayed_work_sync(&mon_d->mbm_over);
+
+			resctrl_offline_mon_domain(&res->resctrl_res, &mon_d->hdr);
+			list_del(&mon_d->hdr.list);
+			kfree(mon_d);
+		}
 		list_for_each_entry_safe(domain, domain_temp, &res->resctrl_res.ctrl_domains,
 					 hdr.list) {
 			resctrl_offline_ctrl_domain(&res->resctrl_res, domain);
@@ -1244,9 +1532,13 @@ int qos_resctrl_setup(void)
 			else
 				exposed_cdp_l3_capable = true;
 		}
+
+		if (ctrl->type == CBQRI_CONTROLLER_TYPE_CAPACITY &&
+		    ctrl->mon_capable && ctrl->cache.cache_level == 3)
+			exposed_mon_capable = true;
 	}
-	pr_debug("alloc=%d cdp_l2=%d cdp_l3=%d\n",
-		 exposed_alloc_capable,
+	pr_debug("alloc=%d mon=%d cdp_l2=%d cdp_l3=%d\n",
+		 exposed_alloc_capable, exposed_mon_capable,
 		 exposed_cdp_l2_capable, exposed_cdp_l3_capable);
 
 	err = resctrl_init();
@@ -1275,6 +1567,7 @@ static void qos_domain_update_cpu(unsigned int cpu, bool online)
 	struct cbqri_resctrl_res *cr;
 	struct cbqri_resctrl_dom *hw_dom;
 	struct rdt_ctrl_domain *cdom;
+	struct rdt_l3_mon_domain *mdom;
 	enum resctrl_res_level rid;
 
 	lockdep_assert_held(&qos_domain_list_lock);
@@ -1298,6 +1591,29 @@ static void qos_domain_update_cpu(unsigned int cpu, bool online)
 				cpumask_set_cpu(cpu, &cdom->hdr.cpu_mask);
 			else
 				cpumask_clear_cpu(cpu, &cdom->hdr.cpu_mask);
+		}
+
+		/*
+		 * Mon_domain ids equal their paired ctrl_domain id (set by
+		 * qos_resctrl_add_controller_domain() at L3), so the
+		 * controller's cpu_mask is reachable through the same-id
+		 * ctrl_domain.
+		 */
+		list_for_each_entry(mdom, &cr->resctrl_res.mon_domains, hdr.list) {
+			cdom = (struct rdt_ctrl_domain *)
+				resctrl_find_domain(&cr->resctrl_res.ctrl_domains,
+						    mdom->hdr.id, NULL);
+			if (!cdom)
+				continue;
+			hw_dom = container_of(cdom, struct cbqri_resctrl_dom,
+					      resctrl_ctrl_dom);
+			if (!hw_dom->hw_ctrl ||
+			    !cpumask_test_cpu(cpu, &hw_dom->hw_ctrl->cache.cpu_mask))
+				continue;
+			if (online)
+				cpumask_set_cpu(cpu, &mdom->hdr.cpu_mask);
+			else
+				cpumask_clear_cpu(cpu, &mdom->hdr.cpu_mask);
 		}
 	}
 }
@@ -1377,11 +1693,19 @@ int riscv_cbqri_register_controller(const struct cbqri_controller_info *info)
 
 	switch (info->type) {
 	case CBQRI_CONTROLLER_TYPE_CAPACITY: {
+		int level;
 		int err;
 
 		ctrl->cache.cache_id = info->cache_id;
-		ctrl->cache.cache_level =
-			find_acpi_cache_level_from_id(info->cache_id);
+
+		level = find_acpi_cache_level_from_id(info->cache_id);
+		if (level < 0) {
+			pr_warn("Failed to resolve cache level for cache id 0x%x (%d), skipping\n",
+				info->cache_id, level);
+			cbqri_controller_destroy(ctrl);
+			return level;
+		}
+		ctrl->cache.cache_level = level;
 
 		if (acpi_pptt_get_cache_size_from_id(info->cache_id,
 						     &ctrl->cache.cache_size)) {
