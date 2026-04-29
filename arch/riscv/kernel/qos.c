@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
+#include <linux/percpu-defs.h>
+#include <linux/types.h>
+
 #include <asm/qos.h>
 
 /* cached value of srmcfg csr for each cpu */
