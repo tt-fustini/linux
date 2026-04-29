@@ -4,6 +4,7 @@
 
 #include <linux/acpi.h>
 #include <linux/bitfield.h>
+#include <linux/cacheinfo.h>
 #include <linux/cbqri.h>
 #include <linux/cpu.h>
 #include <linux/cpufeature.h>
@@ -27,6 +28,22 @@
 static struct cbqri_resctrl_res cbqri_resctrl_resources[RDT_NUM_RESOURCES];
 
 /*
+ * Per-event monitor table.  cbqri_resctrl_pick_counters() populates one
+ * slot per advertised event; cbqri_resctrl_control_init() reads it when
+ * filling rdt_resource caps.  The hot path (resctrl_arch_rmid_read) keeps
+ * its per-domain cbqri_resctrl_dom::paired_bc cache because the lookup
+ * key there is (domain, event), not just event.  Sized to mirror MPAM
+ * (drivers/resctrl/mpam_resctrl.c): only events CBQRI can actually back
+ * occupy a slot, so Intel PMT events do not bloat the array.
+ */
+struct cbqri_resctrl_mon {
+	struct cbqri_controller *ctrl;
+};
+
+#define CBQRI_MAX_EVENT QOS_L3_MBM_TOTAL_EVENT_ID
+static struct cbqri_resctrl_mon cbqri_resctrl_counters[CBQRI_MAX_EVENT + 1];
+
+/*
  * cacheinfo populates the cache id <-> cpumask mapping from a
  * device_initcall().  qos_resctrl_setup() runs at late_initcall, which
  * already happens after device_initcall_sync, but follow MPAM's explicit
@@ -38,11 +55,6 @@ static DECLARE_WAIT_QUEUE_HEAD(wait_cacheinfo_ready);
 
 static bool exposed_alloc_capable;
 static bool exposed_mon_capable;
-/* CDP (code data prioritization) on x86 is AT (access type) on RISC-V */
-static bool exposed_cdp_l2_capable;
-static bool exposed_cdp_l3_capable;
-static bool is_cdp_l2_enabled;
-static bool is_cdp_l3_enabled;
 
 /* used by resctrl_arch_system_num_rmid_idx(); narrowed by cbqri_probe_controller() */
 static u32 max_rmid = U32_MAX;
@@ -267,8 +279,12 @@ static int cbqri_apply_cache_config(struct cbqri_resctrl_dom *hw_dom, u32 closid
 
 	mutex_lock(&ctrl->lock);
 
-	cdp_active = (ctrl->cache.cache_level == 2 && is_cdp_l2_enabled) ||
-		     (ctrl->cache.cache_level == 3 && is_cdp_l3_enabled);
+	if (ctrl->cache.cache_level == 2)
+		cdp_active = cbqri_resctrl_resources[RDT_RESOURCE_L2].cdp_enabled;
+	else if (ctrl->cache.cache_level == 3)
+		cdp_active = cbqri_resctrl_resources[RDT_RESOURCE_L3].cdp_enabled;
+	else
+		cdp_active = false;
 
 	/* Set capacity block mask (cc_block_mask) */
 	cbqri_set_cbm(ctrl, cbm);
@@ -328,6 +344,73 @@ static int cbqri_apply_cache_config(struct cbqri_resctrl_dom *hw_dom, u32 closid
 out:
 	mutex_unlock(&ctrl->lock);
 	return err;
+}
+
+/*
+ * Perform bandwidth usage monitoring operation on bandwidth controller.
+ * Caller must hold ctrl->lock.
+ */
+static int cbqri_bc_mon_op(struct cbqri_controller *ctrl, int operation,
+			   int mcid, int evt_id, u64 *out_reg)
+{
+	u64 reg;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	if (ctrl->faulted)
+		return -EIO;
+
+	reg = FIELD_PREP(CBQRI_MON_CTL_OP_MASK, operation) |
+	      FIELD_PREP(CBQRI_MON_CTL_MCID_MASK, mcid) |
+	      FIELD_PREP(CBQRI_MON_CTL_EVT_ID_MASK, evt_id);
+	iowrite64(reg, ctrl->base + CBQRI_BC_MON_CTL_OFF);
+
+	if (cbqri_wait_busy_flag(ctrl, CBQRI_BC_MON_CTL_OFF, &reg) < 0) {
+		pr_err("BUSY timeout\n");
+		return -EIO;
+	}
+
+	if (FIELD_GET(CBQRI_MON_CTL_STATUS_MASK, reg) !=
+	    CBQRI_BC_MON_CTL_STATUS_SUCCESS)
+		return -EIO;
+
+	if (out_reg)
+		*out_reg = reg;
+
+	return 0;
+}
+
+/*
+ * 62-bit BC counter delta.  Mirrors
+ * arch/x86/kernel/cpu/resctrl/monitor.c::mbm_overflow_count().
+ * Inputs must be pre-masked to CBQRI_BC_MON_CTR_VAL_CTR_MASK.
+ *
+ * The left-shift dance promotes the 62-bit modular subtraction into
+ * 64-bit modular arithmetic so a single wrap (cur < prev) yields the
+ * correct delta rather than a near-2^62 nonsense result.  Multi-wrap
+ * is detected by the caller via the hardware OVF bit
+ * (CBQRI_BC_MON_CTR_VAL_OVF, CBQRI 4.3): on OVF=1 the read path
+ * re-arms the counter and re-anchors instead of feeding this helper
+ * a stale baseline, so this function only needs to recover from at
+ * most one wrap.
+ *
+ * Width hard-coded to the CBQRI spec maximum (62 bits).  The CBQRI
+ * spec's bc_capabilities register does not expose the populated CTR
+ * width, so we cannot derive the shift at probe.  At 62 bits the
+ * counter wraps in ~1.46 years at 100 GB/s, so any reasonable
+ * userspace polling cadence covers single-wrap.  Implementations
+ * that populate fewer CTR bits will overflow faster (e.g. a 32-bit
+ * CTR wraps every ~43 ms at 100 GB/s); on those, OVF will be set
+ * regularly and the read path's re-anchor branch keeps the
+ * accumulator from drifting at the cost of one wrap-period of
+ * bytes per overflow.
+ */
+static u64 cbqri_bc_mon_overflow(u64 prev_ctr, u64 cur_ctr)
+{
+	const unsigned int shift = 64 - 62;
+	u64 chunks = (cur_ctr << shift) - (prev_ctr << shift);
+
+	return chunks >> shift;
 }
 
 /* Perform bandwidth allocation control operation on bandwidth controller */
@@ -626,6 +709,32 @@ static int cbqri_probe_cc(struct cbqri_controller *ctrl)
 		return -ENODEV;
 	}
 
+	/*
+	 * Resolve cache_size via cacheinfo before the mon-capable gate.
+	 * cbqri_probe_controller() runs from qos_resctrl_setup() at
+	 * late_initcall, after wait_event(wait_cacheinfo_ready) returns -
+	 * cacheinfo's device_initcall_sync has populated every online CPU's
+	 * cache topology by then.  cpus_read_lock keeps that topology stable
+	 * across the lookup and satisfies lockdep_assert_cpus_held() inside
+	 * get_cpu_cacheinfo_level().  cache.cpu_mask was filled at register
+	 * time from PPTT and lists every CPU sharing this cache, so any
+	 * online member is fine for the lookup; if every member is offline
+	 * (no cacheinfo populated yet), cache_size stays 0 and the gate
+	 * below disables mon for this CC.
+	 */
+	cpus_read_lock();
+	if (!ctrl->cache.cache_size) {
+		int cpu = cpumask_first_and(&ctrl->cache.cpu_mask, cpu_online_mask);
+
+		if (cpu < nr_cpu_ids) {
+			struct cacheinfo *ci = get_cpu_cacheinfo_level(cpu, ctrl->cache.cache_level);
+
+			if (ci)
+				ctrl->cache.cache_size = ci->size;
+		}
+	}
+	cpus_read_unlock();
+
 	/* Probe monitoring features */
 	err = cbqri_probe_feature(ctrl, CBQRI_CC_MON_CTL_OFF,
 				  CBQRI_CC_MON_CTL_OP_READ_COUNTER, &status,
@@ -637,8 +746,8 @@ static int cbqri_probe_cc(struct cbqri_controller *ctrl)
 		/*
 		 * Occupancy is reported to userspace in bytes, computed
 		 * as cache_size * counter / ncblks (see
-		 * resctrl_arch_rmid_read()).  If PPTT did not give us a
-		 * cache_size, leave mon_capable=false so the file is not
+		 * resctrl_arch_rmid_read()).  If cacheinfo did not give us
+		 * a cache_size, leave mon_capable=false so the file is not
 		 * exposed at all rather than silently returning 0.
 		 */
 		if (!ctrl->cache.cache_size) {
@@ -830,6 +939,32 @@ err_release:
 	return err;
 }
 
+/*
+ * Pair every L3 with the single mon-capable bandwidth controller in the
+ * system, mirroring MPAM's strict "one MSC, one L3" mapping.  CBQRI BCs
+ * live at memory-controller scope, which resctrl does not represent;
+ * the only honest way to surface BC counters as mbm_total_bytes at L3 scope
+ * is to require that there is exactly one BC, so all memory traffic
+ * observed at the LLC necessarily flows through it.  If the platform
+ * exposes zero or more than one mon-capable BC, no L3 gets a paired
+ * BC and mbm_total_bytes is not advertised.
+ */
+static struct cbqri_controller *cbqri_find_only_mon_bc(void)
+{
+	struct cbqri_controller *ctrl, *only_bc = NULL;
+
+	list_for_each_entry(ctrl, &cbqri_controllers, list) {
+		if (ctrl->type != CBQRI_CONTROLLER_TYPE_BANDWIDTH)
+			continue;
+		if (!ctrl->mon_capable)
+			continue;
+		if (only_bc)
+			return NULL;
+		only_bc = ctrl;
+	}
+	return only_bc;
+}
+
 bool resctrl_arch_alloc_capable(void)
 {
 	return exposed_alloc_capable;
@@ -842,37 +977,23 @@ bool resctrl_arch_mon_capable(void)
 
 bool resctrl_arch_get_cdp_enabled(enum resctrl_res_level rid)
 {
-	switch (rid) {
-	case RDT_RESOURCE_L2:
-		return is_cdp_l2_enabled;
-
-	case RDT_RESOURCE_L3:
-		return is_cdp_l3_enabled;
-
-	default:
+	if (rid != RDT_RESOURCE_L2 && rid != RDT_RESOURCE_L3)
 		return false;
-	}
+	return cbqri_resctrl_resources[rid].cdp_enabled;
 }
 
 int resctrl_arch_set_cdp_enabled(enum resctrl_res_level rid, bool enable)
 {
-	switch (rid) {
-	case RDT_RESOURCE_L2:
-		if (!exposed_cdp_l2_capable)
-			return -ENODEV;
-		is_cdp_l2_enabled = enable;
-		break;
+	struct cbqri_resctrl_res *cbqri_res;
 
-	case RDT_RESOURCE_L3:
-		if (!exposed_cdp_l3_capable)
-			return -ENODEV;
-		is_cdp_l3_enabled = enable;
-		break;
-
-	default:
+	if (rid != RDT_RESOURCE_L2 && rid != RDT_RESOURCE_L3)
 		return -ENODEV;
-	}
 
+	cbqri_res = &cbqri_resctrl_resources[rid];
+	if (!cbqri_res->resctrl_res.cdp_capable)
+		return -ENODEV;
+
+	cbqri_res->cdp_enabled = enable;
 	return 0;
 }
 
@@ -1037,6 +1158,7 @@ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
 {
 	struct cbqri_resctrl_dom *hw_dom;
 	struct cbqri_controller *ctrl;
+	struct cbqri_controller *bc;
 	struct rdt_ctrl_domain *d;
 	u64 ctr_val;
 	int err;
@@ -1097,6 +1219,107 @@ out_cc:
 		mutex_unlock(&ctrl->lock);
 		return err;
 
+	case QOS_L3_MBM_TOTAL_EVENT_ID:
+		/*
+		 * The L3 monitoring domain's id is the L3 cache id (see
+		 * qos_resctrl_add_controller_domain()).  The matching ctrl
+		 * domain's hw_dom->paired_bc was cached at add time so we
+		 * don't walk cbqri_controllers on every read.
+		 */
+		d = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+								  hdr->id, NULL);
+		if (!d)
+			return -ENOENT;
+		hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		bc = hw_dom->paired_bc;
+		if (!bc)
+			return -ENOENT;
+		if (WARN_ON_ONCE(!bc->mbm_total_states))
+			return -EIO;
+		if (rmid >= bc->mcid_count)
+			return -ERANGE;
+
+		mutex_lock(&bc->lock);
+		/*
+		 * Each MCID is armed with TOTAL_READ_WRITE at init
+		 * (qos_init_bc_mon_counters()) and re-armed by the OVF
+		 * recovery path below.  Pass EVT_ID=TOTAL_READ_WRITE so
+		 * READ_COUNTER's EVT_ID field matches the configured
+		 * event rather than relying on sticky-last-configured-
+		 * event semantics that the CBQRI register definition
+		 * does not guarantee.  Mirrors the CC READ_COUNTER call
+		 * above which passes EVT_ID=OCCUPANCY for the same reason.
+		 */
+		err = cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_READ_COUNTER,
+				      rmid, CBQRI_BC_EVT_ID_TOTAL_READ_WRITE,
+				      NULL);
+		if (err)
+			goto out_bc;
+
+		ctr_val = ioread64(bc->base + CBQRI_BC_MON_CTR_VAL_OFF);
+
+		if (ctr_val & CBQRI_BC_MON_CTR_VAL_INVALID) {
+			/*
+			 * Hardware marked the counter invalid (CBQRI 4.3:
+			 * controller could not establish an accurate count).
+			 * Return the last good total and leave prev_ctr so
+			 * the next valid sample resumes from there.
+			 */
+			*val = bc->mbm_total_states[rmid].chunks;
+		} else if (ctr_val & CBQRI_BC_MON_CTR_VAL_OVF) {
+			/*
+			 * Hardware overflowed since the previous sample
+			 * (CBQRI 4.3: OVF set on unsigned counter wrap; sticky
+			 * until the next CONFIG_EVENT).  This shouldn't happen
+			 * at the spec's full 62-bit CTR width with any
+			 * reasonable userspace polling cadence, but is the
+			 * expected steady-state symptom on implementations
+			 * that populate fewer CTR bits.  Re-arm the counter
+			 * (resets to 0 and clears OVF), accept the loss of
+			 * one wrap-period of bytes, and re-anchor prev_ctr
+			 * to 0.  Future deltas remain accurate until the
+			 * next overflow.  The cbqri_bc_mon_overflow() shift
+			 * trick can recover at most one wrap; here we do not
+			 * know how many wraps occurred, so re-anchoring is
+			 * the only honest behaviour.
+			 */
+			struct cbqri_bc_mon_state *s = &bc->mbm_total_states[rmid];
+
+			pr_warn_ratelimited("BC@%pa MCID %u: CTR overflow, bandwidth count loses ~one wrap-period; consider a wider CTR or a faster poll cadence\n",
+					    &bc->addr, rmid);
+			/*
+			 * Re-arm the counter (CONFIG_EVENT both resets to 0
+			 * and clears OVF).  On failure cbqri_wait_busy_flag()
+			 * has set bc->faulted, so every subsequent read on
+			 * this controller will fast-fail with -EIO at the
+			 * top of cbqri_bc_mon_op().  Surface the error here
+			 * rather than returning the previously-successful
+			 * READ_COUNTER's err=0: a "success" with stale
+			 * prev_ctr would silently desync future deltas, and
+			 * userspace that reads /sys/.../mbm_total_bytes
+			 * deserves the same monotonic-or-error contract that
+			 * a non-OVF read provides.
+			 */
+			err = cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_CONFIG_EVENT,
+					      rmid, CBQRI_BC_EVT_ID_TOTAL_READ_WRITE,
+					      NULL);
+			if (err)
+				goto out_bc;
+
+			s->prev_ctr = 0;
+			*val = s->chunks;
+		} else {
+			struct cbqri_bc_mon_state *s = &bc->mbm_total_states[rmid];
+			u64 cur = ctr_val & CBQRI_BC_MON_CTR_VAL_CTR_MASK;
+
+			s->chunks  += cbqri_bc_mon_overflow(s->prev_ctr, cur);
+			s->prev_ctr = cur;
+			*val        = s->chunks;
+		}
+out_bc:
+		mutex_unlock(&bc->lock);
+		return err;
+
 	default:
 		return -EINVAL;
 	}
@@ -1107,6 +1330,7 @@ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d
 {
 	struct cbqri_resctrl_dom *hw_dom;
 	struct cbqri_controller *ctrl;
+	struct cbqri_controller *bc;
 	struct rdt_ctrl_domain *cd;
 
 	switch (eventid) {
@@ -1137,6 +1361,34 @@ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d
 		mutex_unlock(&ctrl->lock);
 		return;
 
+	case QOS_L3_MBM_TOTAL_EVENT_ID:
+		cd = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+								   d->hdr.id, NULL);
+		if (!cd)
+			return;
+		hw_dom = container_of(cd, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		bc = hw_dom->paired_bc;
+		if (!bc)
+			return;
+		if (WARN_ON_ONCE(!bc->mbm_total_states))
+			return;
+		if (rmid >= bc->mcid_count)
+			return;
+
+		mutex_lock(&bc->lock);
+		/*
+		 * CONFIG_EVENT both resets and re-arms.  Skip the accumulator
+		 * memset on failure - a stale hardware counter X with
+		 * prev_ctr=0 would inject overflow(0, X) on the next read.
+		 */
+		if (!cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_CONFIG_EVENT,
+				     rmid, CBQRI_BC_EVT_ID_TOTAL_READ_WRITE,
+				     NULL))
+			memset(&bc->mbm_total_states[rmid], 0,
+			       sizeof(*bc->mbm_total_states));
+		mutex_unlock(&bc->lock);
+		return;
+
 	default:
 		return;
 	}
@@ -1157,8 +1409,11 @@ void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_l3_mon_domai
 	int i;
 
 	/* Bound by max_rmid (system-wide minimum mcid_count). */
-	for (i = 0; i < max_rmid; i++)
+	for (i = 0; i < max_rmid; i++) {
 		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_OCCUP_EVENT_ID);
+		/* mbm_total_bytes reset is a no-op for L3s without a paired BC. */
+		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_MBM_TOTAL_EVENT_ID);
+	}
 }
 
 void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
@@ -1570,6 +1825,35 @@ static int cbqri_resctrl_pick_bw_alloc(void)
 }
 
 /*
+ * Walk cbqri_controllers and pick one controller per monitoring event.
+ * Mirrors mpam_resctrl_pick_counters() in
+ * drivers/resctrl/mpam_resctrl.c - the per-event mapping lives in
+ * cbqri_resctrl_counters[] so future events (MBM_LOCAL, READ_ONLY,
+ * WRITE_ONLY) can extend the table without touching the hot path.
+ *
+ * QOS_L3_OCCUP_EVENT_ID is backed by the picked L3 capacity controller
+ * if it advertises mon_capable.  QOS_L3_MBM_TOTAL_EVENT_ID is backed by
+ * the only mon-capable bandwidth controller (single-BC pairing per
+ * cbqri_find_only_mon_bc()).
+ *
+ * The hot path (resctrl_arch_rmid_read) keeps using the per-domain
+ * cbqri_resctrl_dom::paired_bc cache because the lookup key there is
+ * (domain, event), not just event.  This pick records the per-event
+ * pointer so registration code in qos_resctrl_add_controller_domain()
+ * can read it instead of re-deriving via cbqri_find_only_mon_bc().
+ */
+static void cbqri_resctrl_pick_counters(void)
+{
+	struct cbqri_resctrl_res *l3 = &cbqri_resctrl_resources[RDT_RESOURCE_L3];
+
+	if (l3->ctrl && l3->ctrl->mon_capable)
+		cbqri_resctrl_counters[QOS_L3_OCCUP_EVENT_ID].ctrl = l3->ctrl;
+
+	cbqri_resctrl_counters[QOS_L3_MBM_TOTAL_EVENT_ID].ctrl =
+		cbqri_find_only_mon_bc();
+}
+
+/*
  * Fill the rdt_resource fields for one picked rid.  Mirrors
  * mpam_resctrl_control_init() at drivers/resctrl/mpam_resctrl.c.  An rid
  * with no picked controller is left untouched so it stays out of
@@ -1608,6 +1892,19 @@ static int cbqri_resctrl_control_init(struct cbqri_resctrl_res *cbqri_res)
 			res->mon.num_rmid = ctrl->mcid_count;
 			resctrl_enable_mon_event(QOS_L3_OCCUP_EVENT_ID,
 						 false, 0, NULL);
+
+			/*
+			 * Expose BC bandwidth monitoring as the L3's
+			 * mbm_total_bytes event when a BC shares topology with
+			 * this L3, mirroring MPAM's "MB on L3" mapping.
+			 * The event is global; per-domain availability is
+			 * decided in resctrl_arch_rmid_read().  Read the
+			 * picked BC from cbqri_resctrl_counters[] rather
+			 * than re-running cbqri_find_only_mon_bc().
+			 */
+			if (cbqri_resctrl_counters[QOS_L3_MBM_TOTAL_EVENT_ID].ctrl)
+				resctrl_enable_mon_event(QOS_L3_MBM_TOTAL_EVENT_ID,
+							 false, 0, NULL);
 
 			/*
 			 * Set mon_capable last so a partial init never leaves
@@ -1701,15 +1998,58 @@ static int qos_init_mon_counters(struct cbqri_controller *ctrl)
 	return 0;
 }
 
+/* Pre-arm every MCID with TOTAL_READ_WRITE so reads just snapshot. */
+static int qos_init_bc_mon_counters(struct cbqri_controller *bc)
+{
+	int i, err;
+
+	/*
+	 * The single mon-capable BC is reachable from every L3 capacity
+	 * controller via cbqri_find_only_mon_bc(), so this initializer
+	 * is called once per L3 CC during qos_resctrl_setup().  Re-entry
+	 * with state already allocated is benign and would just leak.
+	 */
+	if (bc->mbm_total_states)
+		return 0;
+
+	/*
+	 * Per-MCID software accumulator: each entry tracks the previous
+	 * 62-bit hardware snapshot and the running 64-bit byte total.
+	 * Allocated here rather than at probe so that capacity controllers
+	 * and unpaired bandwidth controllers stay at zero footprint.
+	 */
+	bc->mbm_total_states = kcalloc(bc->mcid_count,
+				       sizeof(*bc->mbm_total_states),
+				       GFP_KERNEL);
+	if (!bc->mbm_total_states)
+		return -ENOMEM;
+
+	for (i = 0; i < bc->mcid_count; i++) {
+		mutex_lock(&bc->lock);
+		err = cbqri_bc_mon_op(bc, CBQRI_BC_MON_CTL_OP_CONFIG_EVENT,
+				      i, CBQRI_BC_EVT_ID_TOTAL_READ_WRITE, NULL);
+		mutex_unlock(&bc->lock);
+		if (err) {
+			kfree(bc->mbm_total_states);
+			bc->mbm_total_states = NULL;
+			return err;
+		}
+	}
+	return 0;
+}
+
+/* Protects ctrl_domain / mon_domain list mutations across CPU hotplug. */
+static DEFINE_MUTEX(qos_domain_list_lock);
+
 /*
- * Allocate a fresh ctrl_domain, attach it to @ctrl, init its default
- * per-CLOSID values for resource @res, add to res->ctrl_domains, and
- * bring it online. On error, the domain is freed before return.
+ * Create, list-insert, and online a fresh ctrl_domain backing @ctrl on
+ * resource @res, seeded with @cpu and identified by @dom_id.  Caller must
+ * hold qos_domain_list_lock and must have already verified that no
+ * existing ctrl_domain on @res carries this id.
  */
-static int qos_register_ctrl_domain(struct cbqri_controller *ctrl,
-				    struct rdt_resource *res,
-				    const struct cpumask *cpu_mask, int dom_id,
-				    struct rdt_ctrl_domain **out_domain)
+static struct rdt_ctrl_domain *qos_create_ctrl_domain(struct cbqri_controller *ctrl,
+						      struct rdt_resource *res,
+						      unsigned int cpu, int dom_id)
 {
 	struct rdt_ctrl_domain *domain;
 	struct list_head *pos = NULL;
@@ -1717,18 +2057,18 @@ static int qos_register_ctrl_domain(struct cbqri_controller *ctrl,
 
 	domain = qos_new_domain(ctrl);
 	if (!domain)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 
-	cpumask_copy(&domain->hdr.cpu_mask, cpu_mask);
+	cpumask_set_cpu(cpu, &domain->hdr.cpu_mask);
 	domain->hdr.id = dom_id;
 
 	err = qos_init_domain_ctrlval(res, domain);
 	if (err)
 		goto err_free;
 
-	if (resctrl_find_domain(&res->ctrl_domains, domain->hdr.id, &pos)) {
-		pr_err("duplicate domain id %d for resource %s\n",
-		       domain->hdr.id, res->name);
+	if (resctrl_find_domain(&res->ctrl_domains, dom_id, &pos)) {
+		pr_err("duplicate ctrl_domain id %d for resource %s\n",
+		       dom_id, res->name);
 		err = -EEXIST;
 		goto err_free;
 	}
@@ -1739,59 +2079,94 @@ static int qos_register_ctrl_domain(struct cbqri_controller *ctrl,
 
 	err = resctrl_online_ctrl_domain(res, domain);
 	if (err) {
-		pr_err("failed to online domain %d\n", domain->hdr.id);
+		pr_err("failed to online ctrl_domain %d on %s\n",
+		       dom_id, res->name);
 		list_del(&domain->hdr.list);
 		goto err_free;
 	}
 
-	if (out_domain)
-		*out_domain = domain;
-	return 0;
+	return domain;
 
 err_free:
 	kfree(container_of(domain, struct cbqri_resctrl_dom, resctrl_ctrl_dom));
-	return err;
-}
-
-static void qos_unregister_ctrl_domain(struct rdt_resource *res,
-				       struct rdt_ctrl_domain *domain)
-{
-	resctrl_offline_ctrl_domain(res, domain);
-	list_del(&domain->hdr.list);
-	kfree(container_of(domain, struct cbqri_resctrl_dom, resctrl_ctrl_dom));
+	return ERR_PTR(err);
 }
 
 /*
- * Allocate, list-insert, and online an L3 monitoring domain backing @ctrl,
- * then arm every MCID with the occupancy event.
+ * Add @cpu to the ctrl_domain on @res with id @dom_id, creating the
+ * domain (the first-CPU-online case) if it does not yet exist.
+ * Returns the resulting ctrl_domain, or ERR_PTR on failure.
+ * Caller must hold qos_domain_list_lock.
  */
-static int qos_attach_l3_mon_domain(struct cbqri_controller *ctrl,
-				    struct rdt_resource *res,
-				    struct rdt_ctrl_domain *ctrl_dom)
+static struct rdt_ctrl_domain *
+qos_attach_cpu_to_ctrl_domain(struct cbqri_controller *ctrl,
+			      struct rdt_resource *res,
+			      unsigned int cpu, int dom_id)
 {
-	struct list_head *mon_pos = NULL;
+	struct rdt_ctrl_domain *domain;
+
+	lockdep_assert_held(&qos_domain_list_lock);
+
+	domain = (struct rdt_ctrl_domain *)
+		resctrl_find_domain(&res->ctrl_domains, dom_id, NULL);
+	if (domain) {
+		cpumask_set_cpu(cpu, &domain->hdr.cpu_mask);
+		return domain;
+	}
+
+	return qos_create_ctrl_domain(ctrl, res, cpu, dom_id);
+}
+
+/*
+ * Add @cpu to the L3 mon_domain backing @ctrl, creating the domain
+ * (and arming MCID counters / pairing with the system-wide mon BC) on
+ * the first-CPU-online case.  The ctrl_domain for this @ctrl must have
+ * already been attached on @res before this is called - the paired_bc
+ * pointer is cached on cbqri_resctrl_dom and the mon_domain id matches
+ * its ctrl_domain id (cache_id).
+ *
+ * Caller must hold qos_domain_list_lock.
+ */
+static int qos_attach_cpu_to_l3_mon(struct cbqri_controller *ctrl,
+				    struct rdt_resource *res,
+				    unsigned int cpu)
+{
 	struct rdt_l3_mon_domain *mon_dom;
+	struct rdt_ctrl_domain *ctrl_dom;
+	struct cbqri_resctrl_dom *hw_dom;
+	struct list_head *mon_pos = NULL;
+	int dom_id = ctrl->cache.cache_id;
 	int err;
+
+	lockdep_assert_held(&qos_domain_list_lock);
+
+	mon_dom = (struct rdt_l3_mon_domain *)
+		resctrl_find_domain(&res->mon_domains, dom_id, NULL);
+	if (mon_dom) {
+		cpumask_set_cpu(cpu, &mon_dom->hdr.cpu_mask);
+		return 0;
+	}
+
+	ctrl_dom = (struct rdt_ctrl_domain *)
+		resctrl_find_domain(&res->ctrl_domains, dom_id, NULL);
+	if (!ctrl_dom) {
+		pr_err("L3 mon attach for cpu %u: no ctrl_domain id %d\n",
+		       cpu, dom_id);
+		return -EINVAL;
+	}
 
 	mon_dom = kzalloc_obj(*mon_dom, GFP_KERNEL);
 	if (!mon_dom)
 		return -ENOMEM;
 
-	mon_dom->hdr.id = ctrl_dom->hdr.id;
+	mon_dom->hdr.id = dom_id;
 	mon_dom->hdr.type = RESCTRL_MON_DOMAIN;
 	mon_dom->hdr.rid = RDT_RESOURCE_L3;
-	cpumask_copy(&mon_dom->hdr.cpu_mask, &ctrl->cache.cpu_mask);
+	cpumask_set_cpu(cpu, &mon_dom->hdr.cpu_mask);
 	INIT_LIST_HEAD(&mon_dom->hdr.list);
 
-	/*
-	 * Reject duplicate domain ids: two L3 capacity controllers sharing a
-	 * cache_id would otherwise leave two entries on res->mon_domains
-	 * with the same id, causing resctrl_offline_mon_domain() to be
-	 * called twice during teardown.  Mirrors the ctrl_domain check in
-	 * qos_register_ctrl_domain().
-	 */
-	if (resctrl_find_domain(&res->mon_domains, mon_dom->hdr.id, &mon_pos)) {
-		pr_err("duplicate L3 mon domain id %d\n", mon_dom->hdr.id);
+	if (resctrl_find_domain(&res->mon_domains, dom_id, &mon_pos)) {
+		pr_err("duplicate L3 mon_domain id %d\n", dom_id);
 		err = -EEXIST;
 		goto err_free;
 	}
@@ -1805,13 +2180,42 @@ static int qos_attach_l3_mon_domain(struct cbqri_controller *ctrl,
 		goto err_listdel;
 
 	err = qos_init_mon_counters(ctrl);
-	if (err) {
-		resctrl_offline_mon_domain(res, &mon_dom->hdr);
-		goto err_listdel;
+	if (err)
+		goto err_offline;
+
+	/*
+	 * Pair the sole mon-capable BC with this L3 domain so its combined
+	 * read+write counter satisfies mbm_total_bytes reads.  The pairing is
+	 * cached on cbqri_resctrl_dom; resctrl_arch_rmid_read() and
+	 * resctrl_arch_reset_rmid() consult it on every hit.
+	 *
+	 * The BC is system-wide (cbqri_find_only_mon_bc() returns one
+	 * controller for all L3 domains) and qos_init_bc_mon_counters()
+	 * is idempotent, so a failure here is not "this domain doesn't
+	 * get mbm_total_bytes" - it is "no domain ever will, and the BC
+	 * is now faulted".  cbqri_resctrl_control_init() has already
+	 * enabled QOS_L3_MBM_TOTAL_EVENT_ID globally; leaving this attach
+	 * to return success would expose mbm_total_bytes to userspace where
+	 * every read returns -ENOENT.  Fail the attach so the cpuhp callback
+	 * surfaces the error.
+	 */
+	hw_dom = container_of(ctrl_dom, struct cbqri_resctrl_dom,
+			      resctrl_ctrl_dom);
+	hw_dom->paired_bc = cbqri_find_only_mon_bc();
+	if (hw_dom->paired_bc) {
+		err = qos_init_bc_mon_counters(hw_dom->paired_bc);
+		if (err) {
+			pr_err("BC @%pa: mon init failed (%d), mbm_total_bytes will be unusable\n",
+			       &hw_dom->paired_bc->addr, err);
+			hw_dom->paired_bc = NULL;
+			goto err_offline;
+		}
 	}
 
 	return 0;
 
+err_offline:
+	resctrl_offline_mon_domain(res, &mon_dom->hdr);
 err_listdel:
 	list_del(&mon_dom->hdr.list);
 err_free:
@@ -1820,34 +2224,18 @@ err_free:
 }
 
 /*
- * Register one rdt_ctrl_domain on the resctrl resource backing @rid for
- * a capacity controller @ctrl, plus the L3 monitoring domain when @ctrl
- * is mon_capable.
+ * Bring up every resource-domain ID that @ctrl backs, attaching @cpu.
+ * Routes through qos_attach_cpu_to_ctrl_domain() so first-cpu-online
+ * lazily creates the rdt_ctrl_domain and subsequent online events just
+ * set the cpu in cpu_mask.  Caller must hold qos_domain_list_lock.
  */
-static int qos_register_cap_controller(struct cbqri_controller *ctrl)
+static int qos_attach_cpu_to_cap_ctrl(struct cbqri_controller *ctrl,
+				      unsigned int cpu)
 {
 	struct cbqri_resctrl_res *cbqri_res;
-	struct rdt_ctrl_domain *domain = NULL;
+	struct rdt_ctrl_domain *ctrl_dom;
 	struct rdt_resource *res;
 	enum resctrl_res_level rid;
-	int err;
-
-	/*
-	 * Monitor-only CCs (mcid_count > 0, rcid_count == 0) are not
-	 * supported in this revision: ctrl_domain registration is gated
-	 * on alloc_capable because cbqri_resctrl_pick_caches() does not
-	 * set up rdt_resource fields for an unpicked rid, and the L3
-	 * mon_domain attach path is wired through qos_register_ctrl_domain.
-	 * Monitor-only support waits on a fs/resctrl change to allow an
-	 * L3 mon_domain to register without a paired ctrl_domain; until
-	 * then, surface this as a warn_once so distros notice that
-	 * monitoring on this controller is unavailable.
-	 */
-	if (!ctrl->alloc_capable) {
-		pr_warn_once("CC @%pa: monitor-only controller skipped (mon support pending fs/resctrl change)\n",
-			     &ctrl->addr);
-		return 0;
-	}
 
 	switch (ctrl->cache.cache_level) {
 	case 2:
@@ -1857,71 +2245,139 @@ static int qos_register_cap_controller(struct cbqri_controller *ctrl)
 		rid = RDT_RESOURCE_L3;
 		break;
 	default:
-		pr_err("unknown cache level %d\n", ctrl->cache.cache_level);
+		pr_err("CC @%pa: unknown cache level %d\n",
+		       &ctrl->addr, ctrl->cache.cache_level);
 		return -ENODEV;
 	}
 
 	cbqri_res = &cbqri_resctrl_resources[rid];
 	res = &cbqri_res->resctrl_res;
 
-	err = qos_register_ctrl_domain(ctrl, res, &ctrl->cache.cpu_mask,
-				       ctrl->cache.cache_id, &domain);
-	if (err)
-		return err;
+	ctrl_dom = qos_attach_cpu_to_ctrl_domain(ctrl, res, cpu,
+						 ctrl->cache.cache_id);
+	if (IS_ERR(ctrl_dom))
+		return PTR_ERR(ctrl_dom);
 
-	if (ctrl->mon_capable && ctrl->cache.cache_level == 3) {
-		err = qos_attach_l3_mon_domain(ctrl, res, domain);
-		if (err) {
-			qos_unregister_ctrl_domain(res, domain);
-			return err;
-		}
-	}
+	if (ctrl->mon_capable && ctrl->cache.cache_level == 3)
+		return qos_attach_cpu_to_l3_mon(ctrl, res, cpu);
+
+	return 0;
+}
+
+static int qos_attach_cpu_to_bw_ctrl(struct cbqri_controller *ctrl,
+				     unsigned int cpu)
+{
+	struct rdt_resource *res_min =
+		&cbqri_resctrl_resources[RDT_RESOURCE_MB_MIN].resctrl_res;
+	struct rdt_resource *res_prop =
+		&cbqri_resctrl_resources[RDT_RESOURCE_MB_WGHT].resctrl_res;
+	struct rdt_ctrl_domain *dom;
+
+	dom = qos_attach_cpu_to_ctrl_domain(ctrl, res_min, cpu,
+					    ctrl->mem.prox_dom);
+	if (IS_ERR(dom))
+		return PTR_ERR(dom);
+
+	dom = qos_attach_cpu_to_ctrl_domain(ctrl, res_prop, cpu,
+					    ctrl->mem.prox_dom);
+	if (IS_ERR(dom))
+		return PTR_ERR(dom);
 
 	return 0;
 }
 
 /*
- * Register MB_MIN and MB_WGHT ctrl_domains for a bandwidth controller.
- * Both schemata share the same hardware controller and proximity domain.
+ * Clear @cpu from every ctrl_domain on @res that lists it.  When the
+ * last CPU of a domain leaves, the domain is offlined, list-deleted,
+ * and freed.  Caller must hold qos_domain_list_lock.
  */
-static int qos_register_bw_controller(struct cbqri_controller *ctrl)
+static void qos_detach_cpu_from_ctrl_domains(struct rdt_resource *res,
+					     unsigned int cpu)
 {
-	struct cbqri_resctrl_res *res_min, *res_prop;
-	struct rdt_ctrl_domain *dom_min = NULL, *dom_prop = NULL;
-	int err;
+	struct rdt_ctrl_domain *domain, *tmp;
 
-	if (!ctrl->alloc_capable)
-		return 0;
+	lockdep_assert_held(&qos_domain_list_lock);
 
-	res_min = &cbqri_resctrl_resources[RDT_RESOURCE_MB_MIN];
-	err = qos_register_ctrl_domain(ctrl, &res_min->resctrl_res,
-				       &ctrl->mem.cpu_mask,
-				       ctrl->mem.prox_dom, &dom_min);
-	if (err)
-		return err;
-
-	res_prop = &cbqri_resctrl_resources[RDT_RESOURCE_MB_WGHT];
-	err = qos_register_ctrl_domain(ctrl, &res_prop->resctrl_res,
-				       &ctrl->mem.cpu_mask,
-				       ctrl->mem.prox_dom, &dom_prop);
-	if (err) {
-		qos_unregister_ctrl_domain(&res_min->resctrl_res, dom_min);
-		return err;
+	list_for_each_entry_safe(domain, tmp, &res->ctrl_domains, hdr.list) {
+		if (!cpumask_test_cpu(cpu, &domain->hdr.cpu_mask))
+			continue;
+		cpumask_clear_cpu(cpu, &domain->hdr.cpu_mask);
+		if (!cpumask_empty(&domain->hdr.cpu_mask))
+			continue;
+		resctrl_offline_ctrl_domain(res, domain);
+		list_del(&domain->hdr.list);
+		kfree(container_of(domain, struct cbqri_resctrl_dom,
+				   resctrl_ctrl_dom));
 	}
-
-	return 0;
 }
 
-static int qos_resctrl_add_controller_domain(struct cbqri_controller *ctrl)
+/*
+ * Clear @cpu from the L3 mon_domain list on @res.  Last-CPU-leaves
+ * triggers cancellation of the per-domain delayed work (cqm_limbo,
+ * mbm_over) before resctrl_offline_mon_domain() runs - same reason
+ * as the teardown path: cancel_delayed_work() inside
+ * resctrl_offline_mon_domain() is not the _sync variant, and a
+ * concurrently-running worker can otherwise dereference per-domain
+ * state after we kfree() it.
+ *
+ * Caller must hold qos_domain_list_lock.
+ */
+static void qos_detach_cpu_from_l3_mon(struct rdt_resource *res,
+				       unsigned int cpu)
 {
-	switch (ctrl->type) {
-	case CBQRI_CONTROLLER_TYPE_CAPACITY:
-		return qos_register_cap_controller(ctrl);
-	case CBQRI_CONTROLLER_TYPE_BANDWIDTH:
-		return qos_register_bw_controller(ctrl);
-	default:
-		pr_err("unknown controller type %d\n", ctrl->type);
-		return -ENODEV;
+	struct rdt_l3_mon_domain *mon_d, *mon_tmp;
+
+	lockdep_assert_held(&qos_domain_list_lock);
+
+	list_for_each_entry_safe(mon_d, mon_tmp, &res->mon_domains, hdr.list) {
+		if (!cpumask_test_cpu(cpu, &mon_d->hdr.cpu_mask))
+			continue;
+		cpumask_clear_cpu(cpu, &mon_d->hdr.cpu_mask);
+		if (!cpumask_empty(&mon_d->hdr.cpu_mask))
+			continue;
+		cancel_delayed_work_sync(&mon_d->cqm_limbo);
+		cancel_delayed_work_sync(&mon_d->mbm_over);
+		resctrl_offline_mon_domain(res, &mon_d->hdr);
+		list_del(&mon_d->hdr.list);
+		kfree(mon_d);
+	}
+}
+
+/*
+ * Walk every probed CBQRI controller and accumulate per-resource and
+ * system-wide capability flags into cbqri_resctrl_resources[] and the
+ * exposed_* globals.  Run after cbqri_resctrl_pick_*() has filtered
+ * heterogeneous-CDP sets at the same cache level, so any one CC that
+ * still reports supports_alloc_at_code faithfully implies the picked
+ * pool at that level does.
+ */
+static void qos_resctrl_accumulate_caps(void)
+{
+	struct cbqri_controller *ctrl;
+
+	list_for_each_entry(ctrl, &cbqri_controllers, list) {
+		if (ctrl->type != CBQRI_CONTROLLER_TYPE_CAPACITY)
+			continue;
+
+		/*
+		 * Monitor-only CCs (mcid_count > 0, rcid_count == 0) are
+		 * not supported in this revision: the L3 mon_domain attach
+		 * path is gated on a paired ctrl_domain because
+		 * cbqri_resctrl_pick_caches() does not set up rdt_resource
+		 * fields for an unpicked rid.  Surface as a warn_once so
+		 * distros notice that monitoring on this controller is
+		 * unavailable.  Lifting this requires a fs/resctrl change
+		 * to allow an L3 mon_domain to register without a paired
+		 * ctrl_domain.
+		 */
+		if (!ctrl->alloc_capable) {
+			pr_warn_once("CC @%pa: monitor-only controller skipped (mon support pending fs/resctrl change)\n",
+				     &ctrl->addr);
+			continue;
+		}
+
+		if (ctrl->mon_capable && ctrl->cache.cache_level == 3)
+			exposed_mon_capable = true;
 	}
 }
 
@@ -2053,6 +2509,7 @@ int qos_resctrl_setup(void)
 	err = cbqri_resctrl_pick_bw_alloc();
 	if (err)
 		goto err_free_controllers_list;
+	cbqri_resctrl_pick_counters();
 
 	/*
 	 * Phase 3: init each picked rid as an rdt_resource.  An rid with no
@@ -2068,37 +2525,21 @@ int qos_resctrl_setup(void)
 	}
 
 	/*
-	 * Phase 4: register one rdt_ctrl_domain per controller.  Domain
-	 * registration runs on the rdt_resource whose fields were populated
-	 * in phase 3.
+	 * Phase 4: derive per-resource and system-wide capability flags
+	 * (cdp_capable, exposed_mon_capable).  rdt_ctrl_domains and the L3
+	 * rdt_l3_mon_domain are NOT created here: that responsibility moves
+	 * to the cpuhp callbacks (qos_resctrl_online_cpu /
+	 * qos_resctrl_offline_cpu) so domain->hdr.cpu_mask only ever
+	 * reflects the online subset of each controller's static cache /
+	 * memory cpu_mask.  cpuhp_setup_state() in qos_arch_late_init()
+	 * replays online events for all already-online CPUs after this
+	 * function returns, populating the lists incrementally.
 	 */
-	list_for_each_entry(ctrl, &cbqri_controllers, list) {
-		err = qos_resctrl_add_controller_domain(ctrl);
-		if (err) {
-			pr_err("failed to add controller domain (%d)\n", err);
-			goto err_free_controllers_list;
-		}
-
-		/*
-		 * CDP (code data prioritization) on x86 is similar to
-		 * the AT (access type) field in CBQRI. CDP only supports
-		 * caches so this must be a CBQRI capacity controller.
-		 */
-		if (ctrl->type == CBQRI_CONTROLLER_TYPE_CAPACITY &&
-		    ctrl->cc.supports_alloc_at_code) {
-			if (ctrl->cache.cache_level == 2)
-				exposed_cdp_l2_capable = true;
-			else
-				exposed_cdp_l3_capable = true;
-		}
-
-		if (ctrl->type == CBQRI_CONTROLLER_TYPE_CAPACITY &&
-		    ctrl->mon_capable && ctrl->cache.cache_level == 3)
-			exposed_mon_capable = true;
-	}
+	qos_resctrl_accumulate_caps();
 	pr_debug("alloc=%d mon=%d cdp_l2=%d cdp_l3=%d\n",
 		 exposed_alloc_capable, exposed_mon_capable,
-		 exposed_cdp_l2_capable, exposed_cdp_l3_capable);
+		 cbqri_resctrl_resources[RDT_RESOURCE_L2].resctrl_res.cdp_capable,
+		 cbqri_resctrl_resources[RDT_RESOURCE_L3].resctrl_res.cdp_capable);
 
 	err = resctrl_init();
 	if (err)
@@ -2112,101 +2553,96 @@ err_free_controllers_list:
 	return err;
 }
 
-/* Protects domain->hdr.cpu_mask mutations (mirrors x86 domain_list_lock). */
-static DEFINE_MUTEX(qos_domain_list_lock);
-
 /*
- * Update domain->hdr.cpu_mask to reflect the online subset of the
- * controller's PPTT/RQSC mask (mirrors x86 domain_add/remove_cpu).
- * Empty domains are not unregistered (matches MPAM).
- * Caller must hold qos_domain_list_lock.
+ * Walk every probed controller and, for each whose static cache /
+ * memory cpu_mask covers @cpu, route the cpu into the matching
+ * resctrl resource's domain via qos_attach_cpu_to_*().  This mirrors
+ * x86 domain_add_cpu_ctrl/domain_add_cpu_mon: the rdt_ctrl_domain
+ * (and L3 rdt_l3_mon_domain) is created on first-CPU-online and
+ * subsequent online events just set the cpu in the existing
+ * cpu_mask.  Returns 0 on success or a partial-attach error on the
+ * first failure; the cpuhp framework will surface the error and
+ * roll the cpu back to its prior state.
  */
-static void qos_domain_update_cpu(unsigned int cpu, bool online)
-{
-	struct cbqri_resctrl_res *cr;
-	struct cbqri_resctrl_dom *hw_dom;
-	struct rdt_ctrl_domain *cdom;
-	struct rdt_l3_mon_domain *mdom;
-	enum resctrl_res_level rid;
-
-	lockdep_assert_held(&qos_domain_list_lock);
-
-	for (rid = 0; rid < RDT_NUM_RESOURCES; rid++) {
-		cr = &cbqri_resctrl_resources[rid];
-		list_for_each_entry(cdom, &cr->resctrl_res.ctrl_domains, hdr.list) {
-			const struct cpumask *src;
-
-			hw_dom = container_of(cdom, struct cbqri_resctrl_dom,
-					      resctrl_ctrl_dom);
-			if (!hw_dom->hw_ctrl)
-				continue;
-			if (hw_dom->hw_ctrl->type == CBQRI_CONTROLLER_TYPE_CAPACITY)
-				src = &hw_dom->hw_ctrl->cache.cpu_mask;
-			else
-				src = &hw_dom->hw_ctrl->mem.cpu_mask;
-			if (!cpumask_test_cpu(cpu, src))
-				continue;
-			if (online)
-				cpumask_set_cpu(cpu, &cdom->hdr.cpu_mask);
-			else
-				cpumask_clear_cpu(cpu, &cdom->hdr.cpu_mask);
-		}
-
-		/*
-		 * Mon_domain ids equal their paired ctrl_domain id (set by
-		 * qos_resctrl_add_controller_domain() at L3), so the
-		 * controller's cpu_mask is reachable through the same-id
-		 * ctrl_domain.
-		 */
-		list_for_each_entry(mdom, &cr->resctrl_res.mon_domains, hdr.list) {
-			cdom = (struct rdt_ctrl_domain *)
-				resctrl_find_domain(&cr->resctrl_res.ctrl_domains,
-						    mdom->hdr.id, NULL);
-			if (!cdom)
-				continue;
-			hw_dom = container_of(cdom, struct cbqri_resctrl_dom,
-					      resctrl_ctrl_dom);
-			if (!hw_dom->hw_ctrl ||
-			    !cpumask_test_cpu(cpu, &hw_dom->hw_ctrl->cache.cpu_mask))
-				continue;
-			if (online)
-				cpumask_set_cpu(cpu, &mdom->hdr.cpu_mask);
-			else
-				cpumask_clear_cpu(cpu, &mdom->hdr.cpu_mask);
-		}
-	}
-}
-
 int qos_resctrl_online_cpu(unsigned int cpu)
 {
+	struct cbqri_controller *ctrl;
+	int err = 0;
+
 	/*
 	 * Hardware resets CSR_SRMCFG to 0 when a CPU is offlined/re-onlined.
 	 * Zero the cached value so the next context switch always re-programs
 	 * the CSR rather than skipping it as "unchanged".
 	 */
 	per_cpu(cpu_srmcfg, cpu) = 0;
+
 	mutex_lock(&qos_domain_list_lock);
-	qos_domain_update_cpu(cpu, true);
+
+	list_for_each_entry(ctrl, &cbqri_controllers, list) {
+		if (!ctrl->alloc_capable)
+			continue;
+
+		switch (ctrl->type) {
+		case CBQRI_CONTROLLER_TYPE_CAPACITY:
+			if (!cpumask_test_cpu(cpu, &ctrl->cache.cpu_mask))
+				continue;
+			err = qos_attach_cpu_to_cap_ctrl(ctrl, cpu);
+			break;
+		case CBQRI_CONTROLLER_TYPE_BANDWIDTH:
+			if (!cpumask_test_cpu(cpu, &ctrl->mem.cpu_mask))
+				continue;
+			err = qos_attach_cpu_to_bw_ctrl(ctrl, cpu);
+			break;
+		default:
+			err = -ENODEV;
+			break;
+		}
+
+		if (err) {
+			pr_err("online cpu %u: ctrl @%pa attach failed (%d)\n",
+			       cpu, &ctrl->addr, err);
+			break;
+		}
+	}
+
 	mutex_unlock(&qos_domain_list_lock);
+
 	resctrl_online_cpu(cpu);
-	return 0;
+	return err;
 }
 
+/*
+ * Symmetric tear-down of qos_resctrl_online_cpu().  Domain cpu_masks
+ * are cleared BEFORE resctrl_offline_cpu() runs: that function calls
+ * get_mon_domain_from_cpu() and mbm_setup_overflow_handler() to
+ * migrate pending MBM work off the leaving CPU; if the bit is still
+ * set, those helpers may pick the very CPU being torn down to host
+ * the next overflow tick.  When the last CPU of a domain leaves,
+ * resctrl_offline_*_domain() is invoked and the domain is freed.
+ */
 int qos_resctrl_offline_cpu(unsigned int cpu)
 {
-	/*
-	 * Clear the departing CPU from each domain's cpu_mask BEFORE
-	 * resctrl_offline_cpu() runs.  resctrl_offline_cpu() calls
-	 * get_mon_domain_from_cpu() and mbm_setup_overflow_handler()
-	 * to migrate pending MBM work off the leaving CPU; if the bit
-	 * is still set, those helpers may pick the very CPU being torn
-	 * down to host the next overflow tick.  This also makes the
-	 * online/offline ordering symmetric with qos_resctrl_online_cpu(),
-	 * which sets the bit before the resctrl call.
-	 */
+	struct rdt_resource *res;
+	enum resctrl_res_level rid;
+
 	mutex_lock(&qos_domain_list_lock);
-	qos_domain_update_cpu(cpu, false);
+
+	/*
+	 * L3 mon_domains first.  resctrl_offline_mon_domain() inside
+	 * qos_detach_cpu_from_l3_mon() drains the per-domain delayed
+	 * work; doing this before the ctrl_domain on the same id is
+	 * removed keeps the ordering matched to qos_resctrl_teardown().
+	 */
+	res = &cbqri_resctrl_resources[RDT_RESOURCE_L3].resctrl_res;
+	qos_detach_cpu_from_l3_mon(res, cpu);
+
+	for (rid = 0; rid < RDT_NUM_RESOURCES; rid++) {
+		res = &cbqri_resctrl_resources[rid].resctrl_res;
+		qos_detach_cpu_from_ctrl_domains(res, cpu);
+	}
+
 	mutex_unlock(&qos_domain_list_lock);
+
 	resctrl_offline_cpu(cpu);
 	return 0;
 }
@@ -2221,6 +2657,7 @@ device_initcall_sync(__cacheinfo_ready);
 
 void cbqri_controller_destroy(struct cbqri_controller *ctrl)
 {
+	kfree(ctrl->mbm_total_states);
 	kfree(ctrl->rbwb_cache);
 	kfree(ctrl);
 }
@@ -2267,12 +2704,15 @@ int riscv_cbqri_register_controller(const struct cbqri_controller_info *info)
 		}
 		ctrl->cache.cache_level = level;
 
-		if (acpi_pptt_get_cache_size_from_id(info->cache_id,
-						     &ctrl->cache.cache_size)) {
-			pr_warn("failed to determine size for cache id 0x%x\n",
-				info->cache_id);
-			ctrl->cache.cache_size = 0;
-		}
+		/*
+		 * cache_size is resolved lazily on first-cpu-online via
+		 * get_cpu_cacheinfo_level() in qos_attach_cpu_to_cap_ctrl().
+		 * cacheinfo is not populated yet at this discovery-time call
+		 * site (still in acpi_arch_init() before late_initcall), and
+		 * a sized lookup that needs cpus_read_lock is the wrong
+		 * primitive at this point in boot anyway.  cache_size stays
+		 * at 0 (kzalloc default) until the cpuhp callback fills it.
+		 */
 
 		err = acpi_pptt_get_cpumask_from_cache_id(info->cache_id,
 							  &ctrl->cache.cpu_mask);
