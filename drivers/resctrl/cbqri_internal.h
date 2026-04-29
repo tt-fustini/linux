@@ -20,6 +20,7 @@
 
 #define CBQRI_BC_CAPABILITIES_OFF 0
 #define CBQRI_BC_MON_CTL_OFF      8
+#define CBQRI_BC_MON_CTR_VAL_OFF 16
 #define CBQRI_BC_ALLOC_CTL_OFF   24
 #define CBQRI_BC_BW_ALLOC_OFF    32
 
@@ -56,11 +57,7 @@
 #define CBQRI_CC_MON_CTL_OP_READ_COUNTER 2
 #define CBQRI_CC_MON_CTL_STATUS_SUCCESS  1
 
-/*
- * bc_mon_ctl op and status used during probe to detect monitoring support.
- * The full monitoring path (CONFIG_EVENT, READ_COUNTER on a real RMID) is
- * added by the bandwidth monitoring patch.
- */
+#define CBQRI_BC_MON_CTL_OP_CONFIG_EVENT 1
 #define CBQRI_BC_MON_CTL_OP_READ_COUNTER 2
 #define CBQRI_BC_MON_CTL_STATUS_SUCCESS  1
 
@@ -73,6 +70,14 @@
 /* Capacity usage monitoring event IDs (CBQRI spec Table 4) */
 #define CBQRI_CC_EVT_ID_NONE         0
 #define CBQRI_CC_EVT_ID_OCCUPANCY    1
+
+/* Bandwidth usage monitoring event IDs (CBQRI spec Table 10) */
+#define CBQRI_BC_EVT_ID_TOTAL_READ_WRITE  1
+
+/* bc_mon_ctr_val layout (CBQRI spec section 4.3, Figure 7) */
+#define CBQRI_BC_MON_CTR_VAL_CTR_MASK    GENMASK_ULL(61, 0)
+#define CBQRI_BC_MON_CTR_VAL_INVALID     BIT_ULL(62)
+#define CBQRI_BC_MON_CTR_VAL_OVF         BIT_ULL(63)
 
 /* Capacity Controller hardware capabilities */
 struct riscv_cbqri_capacity_caps {
@@ -87,6 +92,19 @@ struct riscv_cbqri_bandwidth_caps {
 	u16 mrbwb;   /* max reserved bw blocks */
 
 	bool supports_alloc_at_code;
+};
+
+/**
+ * struct cbqri_bc_mon_state - per-MCID software accumulator for BC bandwidth
+ * @prev_ctr: previous 62-bit hardware snapshot (already masked to CTR field)
+ * @chunks:   accumulated 64-bit byte total across hardware wraparounds
+ *
+ * Mirrors x86's struct arch_mbm_state.  Updated in resctrl_arch_rmid_read()
+ * under cbqri_controller::lock and zeroed by resctrl_arch_reset_rmid().
+ */
+struct cbqri_bc_mon_state {
+	u64 prev_ctr;
+	u64 chunks;
 };
 
 struct cbqri_controller {
@@ -126,6 +144,15 @@ struct cbqri_controller {
 	enum cbqri_controller_type type;
 	u32 rcid_count;
 	u32 mcid_count;
+
+	/*
+	 * Per-MCID 64-bit software accumulator for the BC's MBM_TOTAL event.
+	 * Allocated by qos_init_bc_mon_counters() when this BC is paired with
+	 * an L3 monitoring domain; sized by ->mcid_count.  NULL on capacity
+	 * controllers and on BCs that are not mon-paired.  Protected by ->lock
+	 * along with the surrounding MMIO sequence.
+	 */
+	struct cbqri_bc_mon_state *mbm_total_states;
 
 	/*
 	 * Per-RCID cache of the most recent Rbwb value applied via
@@ -181,6 +208,13 @@ struct cbqri_resctrl_res {
 struct cbqri_resctrl_dom {
 	struct rdt_ctrl_domain  resctrl_ctrl_dom;
 	struct cbqri_controller *hw_ctrl;
+	/*
+	 * For an L3 capacity controller that is paired with a bandwidth
+	 * controller of matching topology, paired_bc caches that BC so
+	 * MBM_TOTAL reads/resets don't have to walk cbqri_controllers on
+	 * every hit.  NULL for non-L3 domains and L3s without a paired BC.
+	 */
+	struct cbqri_controller *paired_bc;
 };
 
 struct cbqri_config {
