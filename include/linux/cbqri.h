@@ -15,6 +15,24 @@ enum cbqri_controller_type {
 	CBQRI_CONTROLLER_TYPE_BANDWIDTH,
 };
 
+/*
+ * Sanity cap on RCID counts coming from firmware (RQSC / DT).  Real CBQRI
+ * hardware advertises tens to a few hundred RCIDs; cap well above that but
+ * far below where the per-RCID MMIO loops in resctrl_arch_reset_all_ctrls()
+ * and qos_init_domain_ctrlval() (each iteration up to ~2ms of polled MMIO)
+ * could trip the soft-lockup watchdog.
+ */
+#define CBQRI_MAX_RCID	1024
+
+/*
+ * Symmetric cap on MCID counts.  Per-MCID MMIO loops in
+ * qos_init_mon_counters() and qos_init_bc_mon_counters() each issue one
+ * CONFIG_EVENT op (up to ~1ms of polled MMIO), so a malformed RQSC table
+ * advertising the full u16 range (65535) would block boot for ~65s and
+ * trip the soft-lockup watchdog.
+ */
+#define CBQRI_MAX_MCID	1024
+
 /**
  * struct cbqri_controller_info - registration descriptor
  * @addr:        MMIO base address of the controller's register interface
@@ -42,12 +60,15 @@ struct cbqri_controller_info {
 
 #if IS_ENABLED(CONFIG_RISCV_CBQRI_DRIVER)
 int riscv_cbqri_register_controller(const struct cbqri_controller_info *info);
+void riscv_cbqri_unregister_last(unsigned int n);
 #else
 static inline int
 riscv_cbqri_register_controller(const struct cbqri_controller_info *info)
 {
 	return -ENODEV;
 }
+
+static inline void riscv_cbqri_unregister_last(unsigned int n) { }
 #endif
 
 #endif /* _LINUX_CBQRI_H */
