@@ -166,6 +166,60 @@ static int cbqri_cc_alloc_op(struct cbqri_controller *ctrl, int operation, int r
 }
 
 /*
+ * Perform capacity usage monitoring operation on capacity controller.
+ * Caller must hold ctrl->lock.
+ */
+static int cbqri_cc_mon_op(struct cbqri_controller *ctrl, int operation,
+			   int mcid, int evt_id, u64 *out_reg)
+{
+	int reg_offset = CBQRI_CC_MON_CTL_OFF;
+	u64 reg;
+
+	lockdep_assert_held(&ctrl->lock);
+
+	if (ctrl->faulted)
+		return -EIO;
+
+	/*
+	 * Read-modify-write with pre-busy poll, mirroring
+	 * cbqri_cc_alloc_op().  Without this, a write issued while the
+	 * controller is still BUSY from a firmware op would either be
+	 * silently dropped or make the post-write cbqri_wait_busy_flag()
+	 * return the firmware op's STATUS instead of ours, which on a
+	 * non-SUCCESS firmware result would set ctrl->faulted=true and
+	 * permanently disable the controller.  Reading first also
+	 * preserves WPRI bit positions that the spec defines with the
+	 * same layout as cc_alloc_ctl.
+	 */
+	reg = ioread64(ctrl->base + reg_offset);
+	if (cbqri_wait_busy_flag(ctrl, reg_offset, &reg) < 0) {
+		pr_err("BUSY timeout before starting operation\n");
+		return -EIO;
+	}
+	reg &= ~CBQRI_MON_CTL_OP_MASK;
+	reg |= FIELD_PREP(CBQRI_MON_CTL_OP_MASK, operation);
+	reg &= ~CBQRI_MON_CTL_MCID_MASK;
+	reg |= FIELD_PREP(CBQRI_MON_CTL_MCID_MASK, mcid);
+	reg &= ~CBQRI_MON_CTL_EVT_ID_MASK;
+	reg |= FIELD_PREP(CBQRI_MON_CTL_EVT_ID_MASK, evt_id);
+	iowrite64(reg, ctrl->base + reg_offset);
+
+	if (cbqri_wait_busy_flag(ctrl, reg_offset, &reg) < 0) {
+		pr_err("BUSY timeout\n");
+		return -EIO;
+	}
+
+	if (FIELD_GET(CBQRI_MON_CTL_STATUS_MASK, reg) !=
+	    CBQRI_CC_MON_CTL_STATUS_SUCCESS)
+		return -EIO;
+
+	if (out_reg)
+		*out_reg = reg;
+
+	return 0;
+}
+
+/*
  * Write a capacity block mask and verify the hardware accepted it by
  * reading back the value after a CONFIG_LIMIT + READ_LIMIT sequence.
  *
@@ -349,6 +403,7 @@ static int cbqri_probe_feature(struct cbqri_controller *ctrl, int reg_offset,
 
 static int cbqri_probe_cc(struct cbqri_controller *ctrl)
 {
+	bool has_mon_at_code = false;
 	int err, status;
 	u64 reg;
 
@@ -387,6 +442,56 @@ static int cbqri_probe_cc(struct cbqri_controller *ctrl)
 		pr_warn("CC at %pa has ncblks=%u > 32 (resctrl CBM is u32), skipping\n",
 			&ctrl->addr, ctrl->cc.ncblks);
 		return -ENODEV;
+	}
+
+	/*
+	 * Resolve cache_size via cacheinfo before the mon-capable gate.
+	 * cbqri_probe_controller() runs from qos_resctrl_setup() at
+	 * late_initcall, after wait_event(wait_cacheinfo_ready) returns -
+	 * cacheinfo's device_initcall_sync has populated every online CPU's
+	 * cache topology by then.  cpus_read_lock keeps that topology stable
+	 * across the lookup and satisfies lockdep_assert_cpus_held() inside
+	 * get_cpu_cacheinfo_level().  cache.cpu_mask was filled at register
+	 * time from PPTT and lists every CPU sharing this cache, so any
+	 * online member is fine for the lookup; if every member is offline
+	 * (no cacheinfo populated yet), cache_size stays 0 and the gate
+	 * below disables mon for this CC.
+	 */
+	cpus_read_lock();
+	if (!ctrl->cache.cache_size) {
+		int cpu = cpumask_first_and(&ctrl->cache.cpu_mask, cpu_online_mask);
+
+		if (cpu < nr_cpu_ids) {
+			struct cacheinfo *ci;
+
+			ci = get_cpu_cacheinfo_level(cpu, ctrl->cache.cache_level);
+			if (ci)
+				ctrl->cache.cache_size = ci->size;
+		}
+	}
+	cpus_read_unlock();
+
+	/* Probe monitoring features */
+	err = cbqri_probe_feature(ctrl, CBQRI_CC_MON_CTL_OFF,
+				  CBQRI_CC_MON_CTL_OP_READ_COUNTER, &status,
+				  &has_mon_at_code);
+	if (err)
+		return err;
+
+	if (status == CBQRI_CC_MON_CTL_STATUS_SUCCESS) {
+		/*
+		 * Occupancy is reported to userspace in bytes, computed
+		 * as cache_size * counter / ncblks (see
+		 * resctrl_arch_rmid_read()).  If cacheinfo did not give us
+		 * a cache_size, leave mon_capable=false so the file is not
+		 * exposed at all rather than silently returning 0.
+		 */
+		if (!ctrl->cache.cache_size) {
+			pr_warn("CC @%pa: cache_size unknown, occupancy monitoring disabled\n",
+				&ctrl->addr);
+		} else {
+			ctrl->mon_capable = true;
+		}
 	}
 
 	/* Probe allocation features */
@@ -670,14 +775,121 @@ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
 			   u32 closid, u32 rmid, enum resctrl_event_id eventid,
 			   void *arch_priv, u64 *val, void *arch_mon_ctx)
 {
-	/* No monitoring events backed in cache-allocation patch; added per-feature later. */
-	return -EINVAL;
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	struct rdt_ctrl_domain *d;
+	u64 ctr_val;
+	int err;
+
+	resctrl_arch_rmid_read_context_check();
+
+	/*
+	 * Each event-id branch takes a sleeping mutex on the owning
+	 * controller (1-ms busy-wait per CBQRI op).  Honour the
+	 * resctrl_arch_rmid_read() contract: if irqs are disabled (e.g.
+	 * smp_call_function_any() from mon_event_read() on nohz_full)
+	 * we cannot sleep, so fail fast and let the caller fall back.
+	 */
+	if (irqs_disabled())
+		return -EIO;
+
+	switch (eventid) {
+	case QOS_L3_OCCUP_EVENT_ID:
+		/*
+		 * The monitoring domain shares the same id as the control
+		 * domain.  Find the control domain to get the hw_ctrl pointer.
+		 */
+		d = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+								  hdr->id, NULL);
+		if (!d)
+			return -ENOENT;
+
+		hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		ctrl = hw_dom->hw_ctrl;
+
+		mutex_lock(&ctrl->lock);
+
+		/*
+		 * Each MCID is armed with the Occupancy event at init
+		 * (qos_init_mon_counters) and re-armed by
+		 * resctrl_arch_reset_rmid() on RMID recycle.  Pass
+		 * EVT_ID=Occupancy so READ_COUNTER's EVT_ID field matches
+		 * the configured event rather than relying on
+		 * sticky-last-configured-event semantics that the CBQRI
+		 * register definition does not guarantee.
+		 */
+		err = cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_READ_COUNTER,
+				      rmid, CBQRI_CC_EVT_ID_OCCUPANCY, NULL);
+		if (err)
+			goto out_cc;
+
+		ctr_val = ioread64(ctrl->base + CBQRI_CC_MON_CTL_VAL_OFF);
+
+		/*
+		 * Convert from capacity blocks to bytes.  Multiply before
+		 * dividing so a non-power-of-2 ncblks does not truncate the
+		 * intermediate result; cache_size and ctr_val both fit in
+		 * u64 with room to spare (cache_size <= a few GiB, ctr_val
+		 * is bounded by ncblks).
+		 */
+		*val = (u64)ctrl->cache.cache_size * ctr_val / ctrl->cc.ncblks;
+out_cc:
+		mutex_unlock(&ctrl->lock);
+		return err;
+
+	default:
+		return -EINVAL;
+	}
 }
 
 void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d,
 			     u32 closid, u32 rmid, enum resctrl_event_id eventid)
 {
-	/* No monitoring events backed in cache-allocation patch; added per-feature later. */
+	struct cbqri_resctrl_dom *hw_dom;
+	struct cbqri_controller *ctrl;
+	struct rdt_ctrl_domain *cd;
+
+	/*
+	 * Mirrors the resctrl_arch_rmid_read() guard: this path takes a
+	 * sleeping ctrl->lock, but mon_event_count() can dispatch via
+	 * smp_call_function_any() from rr->first reads on nohz_full CPUs,
+	 * landing here with IRQs disabled.  Bail rather than mutex_lock()
+	 * in atomic context.
+	 */
+	if (irqs_disabled())
+		return;
+
+	switch (eventid) {
+	case QOS_L3_OCCUP_EVENT_ID:
+		cd = (struct rdt_ctrl_domain *)resctrl_find_domain(&r->ctrl_domains,
+								   d->hdr.id, NULL);
+		if (!cd)
+			return;
+
+		hw_dom = container_of(cd, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		ctrl = hw_dom->hw_ctrl;
+
+		mutex_lock(&ctrl->lock);
+		/*
+		 * Re-arm CONFIG_EVENT with EVT_ID=OCCUPANCY (rather than
+		 * EVT_ID=None) to zero the counter while keeping the MCID
+		 * counting.  resctrl invokes this on RMID recycle when the
+		 * MCID is reassigned to a new monitoring group; if we cleared
+		 * the event configuration, qos_init_mon_counters() (which
+		 * runs once at domain online) would not re-arm and the new
+		 * group's resctrl_arch_rmid_read() would observe a stuck
+		 * zero forever.
+		 */
+		if (cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
+				    rmid, CBQRI_CC_EVT_ID_OCCUPANCY, NULL))
+			pr_warn_ratelimited("CC@%pa MCID %u: occupancy reset failed\n",
+					    &ctrl->addr, rmid);
+		mutex_unlock(&ctrl->lock);
+		return;
+
+	default:
+		return;
+	}
 }
 
 void resctrl_arch_mon_event_config_read(void *info)
@@ -692,7 +904,11 @@ void resctrl_arch_mon_event_config_write(void *info)
 
 void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_l3_mon_domain *d)
 {
-	/* No monitoring events backed in cache-allocation patch; added per-feature later. */
+	int i;
+
+	/* Bound by max_rmid (system-wide minimum mcid_count). */
+	for (i = 0; i < max_rmid; i++)
+		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_OCCUP_EVENT_ID);
 }
 
 void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
@@ -995,6 +1211,19 @@ static int cbqri_resctrl_control_init(struct cbqri_resctrl_res *cbqri_res)
 		 * not reserve the 4 chars for the :CODE / :DATA suffix.
 		 */
 		res->cdp_capable = ctrl->cc.supports_alloc_at_code;
+
+		if (ctrl->mon_capable && res->rid == RDT_RESOURCE_L3) {
+			res->mon_scope = RESCTRL_L3_CACHE;
+			res->mon.num_rmid = ctrl->mcid_count;
+			resctrl_enable_mon_event(QOS_L3_OCCUP_EVENT_ID,
+						 false, 0, NULL);
+
+			/*
+			 * Set mon_capable last so a partial init never leaves
+			 * the resource visible to userspace as "ready".
+			 */
+			res->mon_capable = true;
+		}
 		break;
 
 	default:
@@ -1008,6 +1237,21 @@ static int cbqri_resctrl_control_init(struct cbqri_resctrl_res *cbqri_res)
 	 */
 	res->alloc_capable = ctrl->alloc_capable;
 
+	return 0;
+}
+
+static int qos_init_mon_counters(struct cbqri_controller *ctrl)
+{
+	int i, err;
+
+	for (i = 0; i < ctrl->mcid_count; i++) {
+		mutex_lock(&ctrl->lock);
+		err = cbqri_cc_mon_op(ctrl, CBQRI_CC_MON_CTL_OP_CONFIG_EVENT,
+				      i, CBQRI_CC_EVT_ID_OCCUPANCY, NULL);
+		mutex_unlock(&ctrl->lock);
+		if (err)
+			return err;
+	}
 	return 0;
 }
 
@@ -1091,6 +1335,83 @@ qos_attach_cpu_to_ctrl_domain(struct cbqri_controller *ctrl,
 }
 
 /*
+ * Add @cpu to the L3 mon_domain backing @ctrl, creating the domain
+ * (and arming MCID counters) on the first-CPU-online case.  The
+ * ctrl_domain for this @ctrl must have already been attached on @res
+ * before this is called - the mon_domain id matches its ctrl_domain
+ * id (cache_id).
+ *
+ * Caller must hold qos_domain_list_lock.
+ */
+static int qos_attach_cpu_to_l3_mon(struct cbqri_controller *ctrl,
+				    struct rdt_resource *res,
+				    unsigned int cpu)
+{
+	struct rdt_l3_mon_domain *mon_dom;
+	struct rdt_ctrl_domain *ctrl_dom;
+	struct list_head *mon_pos = NULL;
+	int dom_id = ctrl->cache.cache_id;
+	int err;
+
+	lockdep_assert_held(&qos_domain_list_lock);
+
+	mon_dom = (struct rdt_l3_mon_domain *)
+		resctrl_find_domain(&res->mon_domains, dom_id, NULL);
+	if (mon_dom) {
+		cpumask_set_cpu(cpu, &mon_dom->hdr.cpu_mask);
+		return 0;
+	}
+
+	ctrl_dom = (struct rdt_ctrl_domain *)
+		resctrl_find_domain(&res->ctrl_domains, dom_id, NULL);
+	if (!ctrl_dom) {
+		pr_err("L3 mon attach for cpu %u: no ctrl_domain id %d\n",
+		       cpu, dom_id);
+		return -EINVAL;
+	}
+
+	mon_dom = kzalloc_obj(*mon_dom, GFP_KERNEL);
+	if (!mon_dom)
+		return -ENOMEM;
+
+	mon_dom->hdr.id = dom_id;
+	mon_dom->hdr.type = RESCTRL_MON_DOMAIN;
+	mon_dom->hdr.rid = RDT_RESOURCE_L3;
+	cpumask_set_cpu(cpu, &mon_dom->hdr.cpu_mask);
+	INIT_LIST_HEAD(&mon_dom->hdr.list);
+
+	if (resctrl_find_domain(&res->mon_domains, dom_id, &mon_pos)) {
+		pr_err("duplicate L3 mon_domain id %d\n", dom_id);
+		err = -EEXIST;
+		goto err_free;
+	}
+	if (mon_pos)
+		list_add_tail(&mon_dom->hdr.list, mon_pos);
+	else
+		list_add_tail(&mon_dom->hdr.list, &res->mon_domains);
+
+	err = resctrl_online_mon_domain(res, &mon_dom->hdr);
+	if (err)
+		goto err_listdel;
+
+	err = qos_init_mon_counters(ctrl);
+	if (err)
+		goto err_offline;
+
+	return 0;
+
+err_offline:
+	cancel_delayed_work_sync(&mon_dom->cqm_limbo);
+	cancel_delayed_work_sync(&mon_dom->mbm_over);
+	resctrl_offline_mon_domain(res, &mon_dom->hdr);
+err_listdel:
+	list_del(&mon_dom->hdr.list);
+err_free:
+	kfree(mon_dom);
+	return err;
+}
+
+/*
  * Bring up every resource-domain ID that @ctrl backs, attaching @cpu.
  * Routes through qos_attach_cpu_to_ctrl_domain() so first-cpu-online
  * lazily creates the rdt_ctrl_domain and subsequent online events just
@@ -1125,6 +1446,9 @@ static int qos_attach_cpu_to_cap_ctrl(struct cbqri_controller *ctrl,
 	if (IS_ERR(ctrl_dom))
 		return PTR_ERR(ctrl_dom);
 
+	if (ctrl->mon_capable && ctrl->cache.cache_level == 3)
+		return qos_attach_cpu_to_l3_mon(ctrl, res, cpu);
+
 	return 0;
 }
 
@@ -1150,6 +1474,38 @@ static void qos_detach_cpu_from_ctrl_domains(struct rdt_resource *res,
 		list_del(&domain->hdr.list);
 		kfree(container_of(domain, struct cbqri_resctrl_dom,
 				   resctrl_ctrl_dom));
+	}
+}
+
+/*
+ * Clear @cpu from the L3 mon_domain list on @res.  Last-CPU-leaves
+ * triggers cancellation of the per-domain delayed work (cqm_limbo,
+ * mbm_over) before resctrl_offline_mon_domain() runs - same reason
+ * as the teardown path: cancel_delayed_work() inside
+ * resctrl_offline_mon_domain() is not the _sync variant, and a
+ * concurrently-running worker can otherwise dereference per-domain
+ * state after we kfree() it.
+ *
+ * Caller must hold qos_domain_list_lock.
+ */
+static void qos_detach_cpu_from_l3_mon(struct rdt_resource *res,
+				       unsigned int cpu)
+{
+	struct rdt_l3_mon_domain *mon_d, *mon_tmp;
+
+	lockdep_assert_held(&qos_domain_list_lock);
+
+	list_for_each_entry_safe(mon_d, mon_tmp, &res->mon_domains, hdr.list) {
+		if (!cpumask_test_cpu(cpu, &mon_d->hdr.cpu_mask))
+			continue;
+		cpumask_clear_cpu(cpu, &mon_d->hdr.cpu_mask);
+		if (!cpumask_empty(&mon_d->hdr.cpu_mask))
+			continue;
+		cancel_delayed_work_sync(&mon_d->cqm_limbo);
+		cancel_delayed_work_sync(&mon_d->mbm_over);
+		resctrl_offline_mon_domain(res, &mon_d->hdr);
+		list_del(&mon_d->hdr.list);
+		kfree(mon_d);
 	}
 }
 
@@ -1185,6 +1541,9 @@ static void qos_resctrl_accumulate_caps(void)
 				     &ctrl->addr);
 			continue;
 		}
+
+		if (ctrl->mon_capable && ctrl->cache.cache_level == 3)
+			exposed_mon_capable = true;
 	}
 }
 
@@ -1192,7 +1551,7 @@ static void qos_resctrl_accumulate_caps(void)
 static bool qos_resctrl_inited;
 
 /*
- * Free every per-resource ctrl_domain registered through
+ * Free every per-resource ctrl_domain and mon_domain registered through
  * qos_resctrl_setup(), then - if resctrl_init() was reached - tear
  * down the resctrl FS state, then unmap the MMIO regions claimed by
  * each cbqri_controller in cbqri_probe_controller().  Safe to call
@@ -1210,7 +1569,7 @@ void qos_resctrl_teardown(void)
 	enum resctrl_res_level rid;
 
 	/*
-	 * Serialise the per-rid ctrl domain free loop against
+	 * Serialise the per-rid mon/ctrl domain free loop against
 	 * cpuhp callbacks (qos_resctrl_offline_cpu / online_cpu walk
 	 * the same lists under qos_domain_list_lock).  cpus_read_lock()
 	 * additionally blocks new cpuhp transitions for the duration
@@ -1222,7 +1581,27 @@ void qos_resctrl_teardown(void)
 	mutex_lock(&qos_domain_list_lock);
 
 	for (rid = 0; rid < RDT_NUM_RESOURCES; rid++) {
+		struct rdt_l3_mon_domain *mon_d, *mon_tmp;
+
 		res = &cbqri_resctrl_resources[rid];
+		list_for_each_entry_safe(mon_d, mon_tmp,
+					 &res->resctrl_res.mon_domains, hdr.list) {
+			/*
+			 * Drain mon_d's delayed work before kfree:
+			 * resctrl_offline_mon_domain() uses non-_sync
+			 * cancel, so a worker that has already taken its
+			 * mutex must complete before either fs/resctrl
+			 * frees per-domain state or this loop kfrees
+			 * mon_d.  Same reasoning as in
+			 * qos_attach_cpu_to_l3_mon().
+			 */
+			cancel_delayed_work_sync(&mon_d->cqm_limbo);
+			cancel_delayed_work_sync(&mon_d->mbm_over);
+
+			resctrl_offline_mon_domain(&res->resctrl_res, &mon_d->hdr);
+			list_del(&mon_d->hdr.list);
+			kfree(mon_d);
+		}
 		list_for_each_entry_safe(domain, domain_temp, &res->resctrl_res.ctrl_domains,
 					 hdr.list) {
 			resctrl_offline_ctrl_domain(&res->resctrl_res, domain);
@@ -1313,18 +1692,18 @@ int qos_resctrl_setup(void)
 
 	/*
 	 * Phase 4: derive per-resource and system-wide capability flags
-	 * (cdp_capable).  rdt_ctrl_domains are NOT created here: that
-	 * responsibility moves to the cpuhp callbacks
-	 * (qos_resctrl_online_cpu / qos_resctrl_offline_cpu) so
-	 * domain->hdr.cpu_mask only ever reflects the online subset of
-	 * each controller's static cache cpu_mask.  cpuhp_setup_state()
-	 * in qos_arch_late_init() replays online events for all
-	 * already-online CPUs after this function returns, populating
-	 * the lists incrementally.
+	 * (cdp_capable, exposed_mon_capable).  rdt_ctrl_domains and the L3
+	 * rdt_l3_mon_domain are NOT created here: that responsibility moves
+	 * to the cpuhp callbacks (qos_resctrl_online_cpu /
+	 * qos_resctrl_offline_cpu) so domain->hdr.cpu_mask only ever
+	 * reflects the online subset of each controller's static cache /
+	 * memory cpu_mask.  cpuhp_setup_state() in qos_arch_late_init()
+	 * replays online events for all already-online CPUs after this
+	 * function returns, populating the lists incrementally.
 	 */
 	qos_resctrl_accumulate_caps();
-	pr_debug("alloc=%d cdp_l2=%d cdp_l3=%d\n",
-		 exposed_alloc_capable,
+	pr_debug("alloc=%d mon=%d cdp_l2=%d cdp_l3=%d\n",
+		 exposed_alloc_capable, exposed_mon_capable,
 		 cbqri_resctrl_resources[RDT_RESOURCE_L2].resctrl_res.cdp_capable,
 		 cbqri_resctrl_resources[RDT_RESOURCE_L3].resctrl_res.cdp_capable);
 
@@ -1415,6 +1794,15 @@ int qos_resctrl_offline_cpu(unsigned int cpu)
 	enum resctrl_res_level rid;
 
 	mutex_lock(&qos_domain_list_lock);
+
+	/*
+	 * L3 mon_domains first.  resctrl_offline_mon_domain() inside
+	 * qos_detach_cpu_from_l3_mon() drains the per-domain delayed
+	 * work; doing this before the ctrl_domain on the same id is
+	 * removed keeps the ordering matched to qos_resctrl_teardown().
+	 */
+	res = &cbqri_resctrl_resources[RDT_RESOURCE_L3].resctrl_res;
+	qos_detach_cpu_from_l3_mon(res, cpu);
 
 	for (rid = 0; rid < RDT_NUM_RESOURCES; rid++) {
 		res = &cbqri_resctrl_resources[rid].resctrl_res;

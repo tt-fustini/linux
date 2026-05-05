@@ -14,6 +14,7 @@
 
 #define CBQRI_CC_CAPABILITIES_OFF 0
 #define CBQRI_CC_MON_CTL_OFF      8
+#define CBQRI_CC_MON_CTL_VAL_OFF 16
 #define CBQRI_CC_ALLOC_CTL_OFF   24
 #define CBQRI_CC_BLOCK_MASK_OFF  32
 
@@ -42,6 +43,20 @@
 #define CBQRI_CC_ALLOC_CTL_OP_CONFIG_LIMIT 1
 #define CBQRI_CC_ALLOC_CTL_OP_READ_LIMIT   2
 #define CBQRI_CC_ALLOC_CTL_STATUS_SUCCESS  1
+
+#define CBQRI_CC_MON_CTL_OP_CONFIG_EVENT 1
+#define CBQRI_CC_MON_CTL_OP_READ_COUNTER 2
+#define CBQRI_CC_MON_CTL_STATUS_SUCCESS  1
+
+/* cc_mon_ctl field masks (same layout as alloc_ctl plus EVT_ID) */
+#define CBQRI_MON_CTL_OP_MASK        GENMASK(4, 0)
+#define CBQRI_MON_CTL_MCID_MASK      GENMASK(19, 8)
+#define CBQRI_MON_CTL_EVT_ID_MASK    GENMASK(27, 20)
+#define CBQRI_MON_CTL_STATUS_MASK    GENMASK_ULL(38, 32)
+
+/* Capacity usage monitoring event IDs (CBQRI spec Table 4) */
+#define CBQRI_CC_EVT_ID_NONE         0
+#define CBQRI_CC_EVT_ID_OCCUPANCY    1
 
 /* Capacity Controller hardware capabilities */
 struct riscv_cbqri_capacity_caps {
