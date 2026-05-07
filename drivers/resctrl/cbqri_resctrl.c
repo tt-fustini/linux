@@ -30,6 +30,13 @@ struct cbqri_resctrl_res {
 struct cbqri_resctrl_dom {
 	struct rdt_ctrl_domain  resctrl_ctrl_dom;
 	struct cbqri_controller *hw_ctrl;
+	/*
+	 * For an L3 capacity controller paired with a bandwidth controller
+	 * of matching topology, paired_bc caches that BC so mbm_total_bytes
+	 * reads / resets don't have to walk cbqri_controllers on every hit.
+	 * NULL for non-L3 domains and L3s without a paired BC.
+	 */
+	struct cbqri_controller *paired_bc;
 };
 
 static struct cbqri_resctrl_res cbqri_resctrl_resources[RDT_NUM_RESOURCES];
@@ -38,7 +45,7 @@ static struct cbqri_resctrl_res cbqri_resctrl_resources[RDT_NUM_RESOURCES];
  * Per-event controller table. Only events CBQRI can back occupy a
  * slot, so other events do not bloat the array.
  */
-#define CBQRI_MAX_EVENT QOS_L3_OCCUP_EVENT_ID
+#define CBQRI_MAX_EVENT QOS_L3_MBM_TOTAL_EVENT_ID
 static struct cbqri_controller *cbqri_resctrl_counters[CBQRI_MAX_EVENT + 1];
 
 /*
@@ -239,6 +246,36 @@ void resctrl_arch_reset_rmid(struct rdt_resource *r, struct rdt_l3_mon_domain *d
 		mutex_unlock(&ctrl->lock);
 		return;
 
+	case QOS_L3_MBM_TOTAL_EVENT_ID: {
+		struct cbqri_controller *bc;
+
+		cd = cbqri_find_ctrl_domain(&r->ctrl_domains, d->hdr.id);
+		if (!cd)
+			return;
+		hw_dom = container_of(cd, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		bc = hw_dom->paired_bc;
+		if (!bc)
+			return;
+		if (WARN_ON_ONCE(!bc->mbm_total_states))
+			return;
+		if (rmid >= bc->mcid_count)
+			return;
+
+		mutex_lock(&bc->lock);
+		/*
+		 * CONFIG_EVENT both resets and re-arms. Skip the accumulator
+		 * memset on failure. A stale hardware counter X with
+		 * prev_ctr=0 would inject overflow(0, X) on the next read.
+		 */
+		if (!cbqri_mon_op(bc, CBQRI_BC_MON_CTL_OFF,
+				  CBQRI_BC_MON_CTL_OP_CONFIG_EVENT, rmid,
+				  CBQRI_BC_EVT_ID_TOTAL_READ_WRITE, NULL))
+			memset(&bc->mbm_total_states[rmid], 0,
+			       sizeof(*bc->mbm_total_states));
+		mutex_unlock(&bc->lock);
+		return;
+	}
+
 	default:
 		return;
 	}
@@ -249,8 +286,11 @@ void resctrl_arch_reset_rmid_all(struct rdt_resource *r, struct rdt_l3_mon_domai
 	int i;
 
 	/* Bound by max_rmid (system-wide minimum mcid_count). */
-	for (i = 0; i < max_rmid; i++)
+	for (i = 0; i < max_rmid; i++) {
 		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_OCCUP_EVENT_ID);
+		/* mbm_total_bytes reset is a no-op for L3s without a paired BC. */
+		resctrl_arch_reset_rmid(r, d, 0, i, QOS_L3_MBM_TOTAL_EVENT_ID);
+	}
 }
 
 int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
@@ -307,6 +347,76 @@ int resctrl_arch_rmid_read(struct rdt_resource *r, struct rdt_domain_hdr *hdr,
 out_cc:
 		mutex_unlock(&ctrl->lock);
 		return err;
+
+	case QOS_L3_MBM_TOTAL_EVENT_ID: {
+		struct cbqri_controller *bc;
+
+		/*
+		 * The L3 monitoring domain's id is the L3 cache id. The
+		 * matching ctrl domain's hw_dom->paired_bc was cached at
+		 * add time to avoid walking cbqri_controllers on every read.
+		 */
+		d = cbqri_find_ctrl_domain(&r->ctrl_domains, hdr->id);
+		if (!d)
+			return -ENOENT;
+		hw_dom = container_of(d, struct cbqri_resctrl_dom, resctrl_ctrl_dom);
+		bc = hw_dom->paired_bc;
+		if (!bc)
+			return -ENOENT;
+		if (WARN_ON_ONCE(!bc->mbm_total_states))
+			return -EIO;
+		if (rmid >= bc->mcid_count)
+			return -ERANGE;
+
+		mutex_lock(&bc->lock);
+		/* Pass EVT_ID explicitly. Same reason as the CC path above. */
+		err = cbqri_mon_op(bc, CBQRI_BC_MON_CTL_OFF,
+				   CBQRI_BC_MON_CTL_OP_READ_COUNTER, rmid,
+				   CBQRI_BC_EVT_ID_TOTAL_READ_WRITE, NULL);
+		if (err)
+			goto out_bc;
+
+		ctr_val = ioread64(bc->base + CBQRI_BC_MON_CTR_VAL_OFF);
+
+		if (ctr_val & CBQRI_BC_MON_CTR_VAL_INVALID) {
+			/*
+			 * Hardware marked the counter invalid (CBQRI 4.3:
+			 * controller could not establish an accurate count).
+			 * Return the last good total and leave prev_ctr so
+			 * the next valid sample resumes from there.
+			 */
+			*val = bc->mbm_total_states[rmid].chunks;
+		} else if (ctr_val & CBQRI_BC_MON_CTR_VAL_OVF) {
+			/*
+			 * CBQRI 4.3: OVF is sticky until next CONFIG_EVENT.
+			 * cbqri_bc_mon_overflow() can recover at most one
+			 * wrap. With OVF set the count is unknown, so re-arm
+			 * and re-anchor prev_ctr=0, losing one wrap-period.
+			 */
+			struct cbqri_bc_mon_state *s = &bc->mbm_total_states[rmid];
+
+			pr_warn_ratelimited("BC@%pa MCID %u: CTR overflow, bandwidth count loses ~one wrap-period; consider a wider CTR or a faster poll cadence\n",
+					    &bc->addr, rmid);
+			err = cbqri_mon_op(bc, CBQRI_BC_MON_CTL_OFF,
+					   CBQRI_BC_MON_CTL_OP_CONFIG_EVENT, rmid,
+					   CBQRI_BC_EVT_ID_TOTAL_READ_WRITE, NULL);
+			if (err)
+				goto out_bc;
+
+			s->prev_ctr = 0;
+			*val = s->chunks;
+		} else {
+			struct cbqri_bc_mon_state *s = &bc->mbm_total_states[rmid];
+			u64 cur = ctr_val & CBQRI_BC_MON_CTR_VAL_CTR_MASK;
+
+			s->chunks  += cbqri_bc_mon_overflow(s->prev_ctr, cur);
+			s->prev_ctr = cur;
+			*val        = s->chunks;
+		}
+out_bc:
+		mutex_unlock(&bc->lock);
+		return err;
+	}
 
 	default:
 		return -EINVAL;
@@ -730,6 +840,16 @@ static int cbqri_resctrl_control_init(struct cbqri_resctrl_res *cbqri_res)
 			res->mon.num_rmid = ctrl->mcid_count;
 			resctrl_enable_mon_event(QOS_L3_OCCUP_EVENT_ID,
 						 false, 0, NULL);
+
+			/*
+			 * Expose BC bandwidth monitoring as the L3's
+			 * mbm_total_bytes when a BC shares topology with this
+			 * L3 (MPAM "MB on L3" mapping).
+			 */
+			if (cbqri_resctrl_counters[QOS_L3_MBM_TOTAL_EVENT_ID])
+				resctrl_enable_mon_event(QOS_L3_MBM_TOTAL_EVENT_ID,
+							 false, 0, NULL);
+
 			res->mon_capable = true;
 		}
 		break;
@@ -818,8 +938,8 @@ static int cbqri_resctrl_pick_bw_alloc(void)
 }
 
 /*
- * Pick one controller per monitoring event.  L3 OCCUP comes from the
- * picked L3 CC (if mon_capable).
+ * Pick one controller per monitoring event. L3 OCCUP comes from the
+ * picked L3 CC (if mon_capable). MBM_TOTAL from the only mon-capable BC.
  */
 static void cbqri_resctrl_pick_counters(void)
 {
@@ -827,6 +947,9 @@ static void cbqri_resctrl_pick_counters(void)
 
 	if (l3->ctrl && l3->ctrl->mon_capable)
 		cbqri_resctrl_counters[QOS_L3_OCCUP_EVENT_ID] = l3->ctrl;
+
+	cbqri_resctrl_counters[QOS_L3_MBM_TOTAL_EVENT_ID] =
+		cbqri_find_only_mon_bc();
 }
 
 static void cbqri_resctrl_accumulate_caps(void)
@@ -948,6 +1071,29 @@ static int cbqri_attach_cpu_to_l3_mon(struct cbqri_controller *ctrl,
 	err = cbqri_init_mon_counters(ctrl);
 	if (err)
 		goto err_offline;
+
+	/*
+	 * Pair this L3 domain with the system's mon-capable BC. The
+	 * cached pointer is consulted by every rmid_read / reset_rmid.
+	 * BC mon init is system-wide. Failure here means mbm_total_bytes
+	 * is unusable for any domain, so fail the attach.
+	 */
+	{
+		struct cbqri_resctrl_dom *hw_dom = container_of(ctrl_dom,
+								struct cbqri_resctrl_dom,
+								resctrl_ctrl_dom);
+
+		hw_dom->paired_bc = cbqri_find_only_mon_bc();
+		if (hw_dom->paired_bc) {
+			err = cbqri_init_bc_mon_counters(hw_dom->paired_bc);
+			if (err) {
+				pr_err("BC @%pa: mon init failed (%d)\n",
+				       &hw_dom->paired_bc->addr, err);
+				hw_dom->paired_bc = NULL;
+				goto err_offline;
+			}
+		}
+	}
 
 	return 0;
 
