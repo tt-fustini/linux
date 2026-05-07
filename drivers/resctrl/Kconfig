@@ -52,8 +52,13 @@ config RISCV_CBQRI_DRIVER_DEBUG
 	help
 	  Say yes here to enable debug messages from the CBQRI driver.
 
-	  This adds pr_debug() output covering controller probe and
-	  per-controller registration steps.  Useful when bringing up a
-	  new platform; otherwise leave disabled to avoid log noise.
+	  This adds pr_debug() output covering controller probe,
+	  resctrl resource pick decisions, and per-domain registration
+	  steps. Useful when bringing up a new platform; otherwise
+	  leave disabled to avoid log noise.
 
 endif
+
+config RISCV_CBQRI_RESCTRL_FS
+	bool
+	default y if RISCV_CBQRI_DRIVER && RESCTRL_FS
