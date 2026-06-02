@@ -279,6 +279,10 @@ enum resctrl_ctrl_unit {
  *			"all" for a proportional schema. Base unit of an
  *			absolute control, for example "GBps".
  * @mba_sc:		True if MBA software controller(mba_sc) is enabled
+ * @default_to_min:	True if new groups reset to @min_bw instead of @max_bw.
+ *			Used by controls that allocate from a constrained pool
+ *			(for example a reserved minimum bandwidth) where a new
+ *			group claiming @max_bw would overcommit the resource.
  *
  * With a control value "C" written to the schemata file, min_bw <= C <= max_bw,
  * the amount of resource allocated by this control is:
@@ -293,6 +297,7 @@ struct resctrl_membw {
 	u32				scale;
 	enum resctrl_ctrl_unit		unit;
 	bool				mba_sc;
+	bool				default_to_min;
 };
 
 enum resctrl_scope {
@@ -485,7 +490,8 @@ static inline u32 resctrl_get_default_ctrlval(struct resctrl_ctrl *ctrl)
 	case RESCTRL_CTRL_BITMAP:
 		return BIT_MASK(ctrl->cache.cbm_len) - 1;
 	case RESCTRL_CTRL_SCALAR:
-		return ctrl->membw.max_bw;
+		return ctrl->membw.default_to_min ? ctrl->membw.min_bw :
+						    ctrl->membw.max_bw;
 	}
 
 	return WARN_ON_ONCE(1);
