@@ -214,6 +214,9 @@ static __init bool __temporary_multiple_mba_intel_controls(struct rdt_resource *
 	case RESCTRL_CTRL_NAME_MAX:
 		hw_ctrl->msr_update = update_temporary_max;
 		break;
+	case RESCTRL_CTRL_NAME_WGHT:
+		/* No weight-based bandwidth control on x86. */
+		break;
 	}
 
 	return true;
