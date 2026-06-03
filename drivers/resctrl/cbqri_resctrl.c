@@ -950,6 +950,11 @@ static int cbqri_resctrl_control_init(struct cbqri_resctrl_res *cbqri_res)
 					RESCTRL_CTRL_NAME_MIN);
 		if (!r_ctrl)
 			return -EINVAL;
+		/*
+		 * CBQRI section 4.5 caps sum(Rbwb) <= MRBWB. A MIN control
+		 * resets new groups to min_bw, so 1 (one reserved block) keeps
+		 * mkdir from overflowing that sum.
+		 */
 		r_ctrl->membw.min_bw = 1;
 		/*
 		 * cbqri_apply_rbwb() rejects an Rbwb above U16_MAX, so cap the
@@ -959,17 +964,12 @@ static int cbqri_resctrl_control_init(struct cbqri_resctrl_res *cbqri_res)
 		 */
 		r_ctrl->membw.max_bw = min_t(u32, ctrl->bc.mrbwb, U16_MAX);
 		r_ctrl->membw.bw_gran = 1;
-		/*
-		 * CBQRI section 4.5 caps sum(Rbwb) <= MRBWB. Default new
-		 * groups to min_bw so mkdir cannot overflow that sum.
-		 */
-		r_ctrl->membw.default_to_min = true;
 
 		/*
 		 * WGHT control: CBQRI Mweight (weighted share of unreserved
 		 * bandwidth). Section 4.5: Mweight is 0-255 (0 disables
-		 * work-conserving). No sum constraint, so leave default_to_min
-		 * false; groups default to max_bw (255).
+		 * work-conserving). Not a MIN control, so new groups default to
+		 * max_bw (255) and leave no bandwidth idle.
 		 */
 		r_ctrl = cbqri_add_ctrl(cbqri_res, RESCTRL_L3_CACHE,
 					RESCTRL_CTRL_SCALAR,
