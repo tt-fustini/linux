@@ -485,6 +485,8 @@ static inline u32 resctrl_get_default_ctrlval(struct resctrl_ctrl *ctrl)
 	case RESCTRL_CTRL_BITMAP:
 		return BIT_MASK(ctrl->cache.cbm_len) - 1;
 	case RESCTRL_CTRL_SCALAR:
+		if (ctrl->name == RESCTRL_CTRL_NAME_MIN)
+			return ctrl->membw.min_bw;
 		return ctrl->membw.max_bw;
 	}
 
