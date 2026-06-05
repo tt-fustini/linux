@@ -20,14 +20,14 @@
 
 #include "cbqri_internal.h"
 
-/* Cache resources carry a single DEF control. */
-#define CBQRI_MAX_CTRLS_PER_RES	1
+/* Most controls per resource: MB has MIN and WGHT, caches have one DEF. */
+#define CBQRI_MAX_CTRLS_PER_RES	2
 
 /*
  * struct cbqri_hw_ctrl - arch private wrapper around a resctrl control
  * @r_ctrl:	control properties exposed to fs/resctrl
- * @hw:		backing CBQRI controller (the backing CC backs a cache
- *		resource's single control)
+ * @hw:		backing CBQRI controller (the same BC backs both bandwidth
+ *		controls; the backing CC backs a cache resource's single control)
  */
 struct cbqri_hw_ctrl {
 	struct resctrl_ctrl	r_ctrl;
@@ -396,6 +396,8 @@ int resctrl_arch_update_one(struct rdt_resource *r, struct resctrl_ctrl *ctrl,
 	case RESCTRL_CTRL_NAME_MIN:
 		/* sum(Rbwb) <= MRBWB validation runs inside cbqri_apply_rbwb(). */
 		return cbqri_apply_rbwb(dom->hw_ctrl, closid, cfg_val, true);
+	case RESCTRL_CTRL_NAME_WGHT:
+		return cbqri_apply_mweight_config(dom->hw_ctrl, closid, cfg_val);
 	default:
 		return -EINVAL;
 	}
@@ -460,6 +462,14 @@ u32 resctrl_arch_get_config(struct rdt_resource *r, struct resctrl_ctrl *ctrl,
 		err = cbqri_read_rbwb(hw, closid, &rbwb);
 		if (err == 0)
 			val = (u32)rbwb;
+		break;
+	}
+	case RESCTRL_CTRL_NAME_WGHT: {
+		u64 mweight;
+
+		err = cbqri_read_mweight(hw, closid, &mweight);
+		if (err == 0)
+			val = (u32)mweight;
 		break;
 	}
 	default:
@@ -539,6 +549,18 @@ void resctrl_arch_reset_all_ctrls(struct rdt_resource *r)
 								   rcid, rerr);
 				}
 				break;
+			case RESCTRL_CTRL_NAME_WGHT:
+				/* All RCIDs start at max weight (the new-group default). */
+				for (i = 0; i < hw_res->ctrl->rcid_count; i++) {
+					int rerr;
+
+					rerr = cbqri_apply_mweight_config(dom->hw_ctrl, i,
+									  default_ctrl);
+					if (rerr)
+						pr_err_ratelimited("Mweight reset RCID %u failed (%d)\n",
+								   i, rerr);
+				}
+				break;
 			default:
 				break;
 			}
@@ -611,6 +633,11 @@ static int cbqri_init_domain_ctrlval(struct rdt_resource *r,
 			err = cbqri_apply_rbwb(dom->hw_ctrl, rcid, rbwb, false);
 			break;
 		}
+		case RESCTRL_CTRL_NAME_WGHT:
+			/* Match the new-group default: equal weights across RCIDs. */
+			err = cbqri_apply_mweight_config(dom->hw_ctrl, i,
+							 default_ctrl);
+			break;
 		default:
 			err = -EINVAL;
 			break;
@@ -682,7 +709,8 @@ static int cbqri_resctrl_pick_caches(void)
 /*
  * Append one arch control wrapper to a resource's control list. Each control
  * carries its own scope and domain list. The backing CBQRI controller hw is
- * the same CC for a cache resource's single control.
+ * the same CC for a cache resource's single control, and the same BC for both
+ * bandwidth controls.
  */
 static struct resctrl_ctrl *
 cbqri_add_ctrl(struct cbqri_resctrl_res *cbqri_res, enum resctrl_scope scope,
@@ -786,6 +814,21 @@ static int cbqri_resctrl_control_init(struct cbqri_resctrl_res *cbqri_res)
 		 * u16 today, so this only bites if its width ever grows.
 		 */
 		r_ctrl->membw.max_bw = min_t(u32, ctrl->bc.mrbwb, U16_MAX);
+		r_ctrl->membw.bw_gran = 1;
+
+		/*
+		 * WGHT control: CBQRI Mweight (weighted share of unreserved
+		 * bandwidth). Section 4.5: Mweight is 0-255 (0 disables
+		 * work-conserving). Not a MIN control, so new groups default to
+		 * max_bw (255) and leave no bandwidth idle.
+		 */
+		r_ctrl = cbqri_add_ctrl(cbqri_res, RESCTRL_L3_CACHE,
+					RESCTRL_CTRL_SCALAR,
+					RESCTRL_CTRL_NAME_WGHT);
+		if (!r_ctrl)
+			return -EINVAL;
+		r_ctrl->membw.min_bw = 0;
+		r_ctrl->membw.max_bw = 255;
 		r_ctrl->membw.bw_gran = 1;
 		break;
 
