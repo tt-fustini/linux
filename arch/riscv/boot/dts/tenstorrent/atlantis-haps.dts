@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+/dts-v1/;
+
+#include "atlantis-soc.dtsi"
+
+/ {
+	model = "Tenstorrent Atlantis development platform";
+	compatible = "tenstorrent,atlantis-evb", "tenstorrent,atlantis";
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x0 0x00000000 0x0 0x80000000>,
+		      <0x1 0x80000000 0x0 0x80000000>;
+	};
+
+	aliases {
+		serial0 = &uart1;
+	};
+
+	chosen {
+		bootargs = "earlycon console=ttyS0,4800";
+		stdout-path = "serial0:4800n8";
+        };
+};
+
+&cpu1 {
+	status = "disabled";
+};
+
+&cpu2 {
+	status = "disabled";
+};
+
+&cpu3 {
+	status = "disabled";
+};
+
+&cpu4 {
+	status = "disabled";
+};
+
+&cpu5 {
+	status = "disabled";
+};
+
+&cpu6 {
+	status = "disabled";
+};
+
+&cpu7 {
+	status = "disabled";
+};
+
+&uart1 {
+	/delete-property/ clocks;
+	clock-frequency = <5000000>;
+	current-speed = <4800>;
+	status = "okay";
+};
