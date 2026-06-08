@@ -32,9 +32,9 @@
 					       "shcounterenw", "shgatpa", "shtvala", "shvsatpa",
 					       "shvstvala", "shvstvecd", "smaia", "smmpm", "smnpm",
 					       "smrnmi", "smstateen", "ssaia", "ssccptr",
-					       "sscofpmf", "sscounterenw", "ssnpm", "ssstateen",
-					       "sstc", "sstvala", "sstvecd", "ssu64xl", "svade",
-					       "svinval", "svnapot", "svpbmt";
+					       "sscofpmf", "sscounterenw", "ssnpm", "ssqosid",
+					       "ssstateen", "sstc", "sstvala", "sstvecd", "ssu64xl",
+					       "svade", "svinval", "svnapot", "svpbmt";
 			riscv,cbom-block-size = <64>;
 			riscv,cbop-block-size = <64>;
 			riscv,cboz-block-size = <64>;
@@ -70,9 +70,9 @@
 					       "shcounterenw", "shgatpa", "shtvala", "shvsatpa",
 					       "shvstvala", "shvstvecd", "smaia", "smmpm", "smnpm",
 					       "smrnmi", "smstateen", "ssaia", "ssccptr",
-					       "sscofpmf", "sscounterenw", "ssnpm", "ssstateen",
-					       "sstc", "sstvala", "sstvecd", "ssu64xl", "svade",
-					       "svinval", "svnapot", "svpbmt";
+					       "sscofpmf", "sscounterenw", "ssnpm", "ssqosid",
+					       "ssstateen", "sstc", "sstvala", "sstvecd", "ssu64xl",
+					       "svade", "svinval", "svnapot", "svpbmt";
 			riscv,cbom-block-size = <64>;
 			riscv,cbop-block-size = <64>;
 			riscv,cboz-block-size = <64>;
@@ -108,9 +108,9 @@
 					       "shcounterenw", "shgatpa", "shtvala", "shvsatpa",
 					       "shvstvala", "shvstvecd", "smaia", "smmpm", "smnpm",
 					       "smrnmi", "smstateen", "ssaia", "ssccptr",
-					       "sscofpmf", "sscounterenw", "ssnpm", "ssstateen",
-					       "sstc", "sstvala", "sstvecd", "ssu64xl", "svade",
-					       "svinval", "svnapot", "svpbmt";
+					       "sscofpmf", "sscounterenw", "ssnpm", "ssqosid",
+					       "ssstateen", "sstc", "sstvala", "sstvecd", "ssu64xl",
+					       "svade", "svinval", "svnapot", "svpbmt";
 			riscv,cbom-block-size = <64>;
 			riscv,cbop-block-size = <64>;
 			riscv,cboz-block-size = <64>;
@@ -146,9 +146,9 @@
 					       "shcounterenw", "shgatpa", "shtvala", "shvsatpa",
 					       "shvstvala", "shvstvecd", "smaia", "smmpm", "smnpm",
 					       "smrnmi", "smstateen", "ssaia", "ssccptr",
-					       "sscofpmf", "sscounterenw", "ssnpm", "ssstateen",
-					       "sstc", "sstvala", "sstvecd", "ssu64xl", "svade",
-					       "svinval", "svnapot", "svpbmt";
+					       "sscofpmf", "sscounterenw", "ssnpm", "ssqosid",
+					       "ssstateen", "sstc", "sstvala", "sstvecd", "ssu64xl",
+					       "svade", "svinval", "svnapot", "svpbmt";
 			riscv,cbom-block-size = <64>;
 			riscv,cbop-block-size = <64>;
 			riscv,cboz-block-size = <64>;
@@ -184,9 +184,9 @@
 					       "shcounterenw", "shgatpa", "shtvala", "shvsatpa",
 					       "shvstvala", "shvstvecd", "smaia", "smmpm", "smnpm",
 					       "smrnmi", "smstateen", "ssaia", "ssccptr",
-					       "sscofpmf", "sscounterenw", "ssnpm", "ssstateen",
-					       "sstc", "sstvala", "sstvecd", "ssu64xl", "svade",
-					       "svinval", "svnapot", "svpbmt";
+					       "sscofpmf", "sscounterenw", "ssnpm", "ssqosid",
+					       "ssstateen", "sstc", "sstvala", "sstvecd", "ssu64xl",
+					       "svade", "svinval", "svnapot", "svpbmt";
 			riscv,cbom-block-size = <64>;
 			riscv,cbop-block-size = <64>;
 			riscv,cboz-block-size = <64>;
@@ -222,9 +222,9 @@
 					       "shcounterenw", "shgatpa", "shtvala", "shvsatpa",
 					       "shvstvala", "shvstvecd", "smaia", "smmpm", "smnpm",
 					       "smrnmi", "smstateen", "ssaia", "ssccptr",
-					       "sscofpmf", "sscounterenw", "ssnpm", "ssstateen",
-					       "sstc", "sstvala", "sstvecd", "ssu64xl", "svade",
-					       "svinval", "svnapot", "svpbmt";
+					       "sscofpmf", "sscounterenw", "ssnpm", "ssqosid",
+					       "ssstateen", "sstc", "sstvala", "sstvecd", "ssu64xl",
+					       "svade", "svinval", "svnapot", "svpbmt";
 			riscv,cbom-block-size = <64>;
 			riscv,cbop-block-size = <64>;
 			riscv,cboz-block-size = <64>;
@@ -260,9 +260,9 @@
 					       "shcounterenw", "shgatpa", "shtvala", "shvsatpa",
 					       "shvstvala", "shvstvecd", "smaia", "smmpm", "smnpm",
 					       "smrnmi", "smstateen", "ssaia", "ssccptr",
-					       "sscofpmf", "sscounterenw", "ssnpm", "ssstateen",
-					       "sstc", "sstvala", "sstvecd", "ssu64xl", "svade",
-					       "svinval", "svnapot", "svpbmt";
+					       "sscofpmf", "sscounterenw", "ssnpm", "ssqosid",
+					       "ssstateen", "sstc", "sstvala", "sstvecd", "ssu64xl",
+					       "svade", "svinval", "svnapot", "svpbmt";
 			riscv,cbom-block-size = <64>;
 			riscv,cbop-block-size = <64>;
 			riscv,cboz-block-size = <64>;
@@ -298,9 +298,9 @@
 					       "shcounterenw", "shgatpa", "shtvala", "shvsatpa",
 					       "shvstvala", "shvstvecd", "smaia", "smmpm", "smnpm",
 					       "smrnmi", "smstateen", "ssaia", "ssccptr",
-					       "sscofpmf", "sscounterenw", "ssnpm", "ssstateen",
-					       "sstc", "sstvala", "sstvecd", "ssu64xl", "svade",
-					       "svinval", "svnapot", "svpbmt";
+					       "sscofpmf", "sscounterenw", "ssnpm", "ssqosid",
+					       "ssstateen", "sstc", "sstvala", "sstvecd", "ssu64xl",
+					       "svade", "svinval", "svnapot", "svpbmt";
 			riscv,cbom-block-size = <64>;
 			riscv,cbop-block-size = <64>;
 			riscv,cboz-block-size = <64>;
