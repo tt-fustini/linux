@@ -371,6 +371,14 @@
 			reg = <0x0 0xa2180000 0x0 0x8000 0x0 0xa2188000 0x0 0x8000>;
 		};
 
+		sc_cbqri: cache-controller@a21a00c0 {
+			compatible = "tenstorrent,ascalon-sc-cbqri",
+				     "riscv,cbqri-capacity-controller";
+			reg = <0x0 0xa21a00c0 0x0 0xf40>;
+			riscv,cbqri-rcid = <16>;
+			riscv,cbqri-cache = <&l2_cache>;
+		};
+
 		imsic_s: interrupt-controller@a4000000 {
 			compatible = "tenstorrent,atlantis-imsics", "riscv,imsics";
 			riscv,num-ids = <255>;
