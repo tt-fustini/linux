@@ -406,7 +406,7 @@
 			#clock-cells = <1>;
 			#reset-cells = <1>;
 			assigned-clocks = <&prcm_rcpu CLK_RCPU_ROOT>, <&prcm_rcpu CLK_NOCC_CLK>;
-			assigned-clock-parents = <&prcm_rcpu CLK_RCPU_ROOT>,
+			assigned-clock-parents = <&prcm_rcpu CLK_RCPU_PLL>,
 						 <&prcm_rcpu CLK_NOC_PLL>;
 		};
 
