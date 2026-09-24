@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpio/tenstorrent,atlantis-gpio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Tenstorrent Atlantis GPIO controller
+
+maintainers:
+  - Drew Fustini <dfustini@oss.tenstorrent.com>
+
+description:
+  The GPIO controller in the Tenstorrent Atlantis SoC has 32 lines. Each line
+  can be configured as an input or an output and can raise an edge or level
+  triggered interrupt. The controller has two interrupt outputs and routes
+  each line to one of them. A debounce filter with one clock divider shared
+  by all lines can be enabled per line.
+
+properties:
+  compatible:
+    const: tenstorrent,atlantis-gpio
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    items:
+      - description: First combined interrupt output
+      - description: Second combined interrupt output
+
+  clocks:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  gpio-controller: true
+
+  "#gpio-cells":
+    const: 2
+
+  interrupt-controller: true
+
+  "#interrupt-cells":
+    const: 2
+
+  gpio-ranges:
+    maxItems: 1
+
+  gpio-line-names:
+    maxItems: 32
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - clocks
+  - gpio-controller
+  - "#gpio-cells"
+  - interrupt-controller
+  - "#interrupt-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/clock/tenstorrent,atlantis-prcm-rcpu.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    gpio@b0150000 {
+        compatible = "tenstorrent,atlantis-gpio";
+        reg = <0xb0150000 0x10000>;
+        interrupts = <47 IRQ_TYPE_LEVEL_HIGH>, <48 IRQ_TYPE_LEVEL_HIGH>;
+        clocks = <&prcm_rcpu CLK_GPIO_PCLK>;
+        resets = <&prcm_rcpu RST_GPIO>;
+        gpio-controller;
+        #gpio-cells = <2>;
+        interrupt-controller;
+        #interrupt-cells = <2>;
+    };
