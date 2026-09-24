@@ -188,6 +188,7 @@ obj-$(CONFIG_GPIO_TC3589X)		+= gpio-tc3589x.o
 obj-$(CONFIG_GPIO_TC9563)		+= gpio-tc9563.o
 obj-$(CONFIG_GPIO_TEGRA186)		+= gpio-tegra186.o
 obj-$(CONFIG_GPIO_TEGRA)		+= gpio-tegra.o
+obj-$(CONFIG_GPIO_TENSTORRENT_ATLANTIS)	+= gpio-tenstorrent-atlantis.o
 obj-$(CONFIG_GPIO_THUNDERX)		+= gpio-thunderx.o
 obj-$(CONFIG_GPIO_TIMBERDALE)		+= gpio-timberdale.o
 obj-$(CONFIG_GPIO_TN48M_CPLD)		+= gpio-tn48m.o

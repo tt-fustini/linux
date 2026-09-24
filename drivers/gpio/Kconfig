@@ -813,6 +813,20 @@ config GPIO_TEGRA186
 	help
 	  Say yes here to support GPIO pins on NVIDIA Tegra186, 194 and 234 SoCs.
 
+config GPIO_TENSTORRENT_ATLANTIS
+	tristate "Tenstorrent Atlantis GPIO support"
+	depends on ARCH_TENSTORRENT || COMPILE_TEST
+	default ARCH_TENSTORRENT
+	select GPIO_GENERIC
+	select GPIOLIB_IRQCHIP
+	help
+	  Say yes here to support the GPIO controller found in the Tenstorrent
+	  Atlantis SoC. The controller has 32 lines, each of which can raise an
+	  edge or level triggered interrupt and has a debounce filter.
+
+	  This driver can also be built as a module. If so, the module will be
+	  called gpio-tenstorrent-atlantis.
+
 config GPIO_TS4800
 	tristate "TS-4800 DIO blocks and compatibles"
 	depends on SOC_IMX51 || COMPILE_TEST
