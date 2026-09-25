@@ -487,6 +487,18 @@ config PCIE_STM32_EP
 	  This driver can also be built as a module. If so, the module
 	  will be called pcie-stm32-ep.
 
+config PCIE_TENSTORRENT
+	tristate "Tenstorrent Atlantis PCIe controller (host mode)"
+	depends on ARCH_TENSTORRENT || COMPILE_TEST
+	depends on PCI_MSI
+	select PCIE_DW_HOST
+	help
+	  Enables support for the DesignWare based PCIe controllers of the
+	  Tenstorrent Atlantis SoC operating in host mode.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called pcie-tenstorrent.
+
 config PCI_DRA7XX
 	tristate
 
