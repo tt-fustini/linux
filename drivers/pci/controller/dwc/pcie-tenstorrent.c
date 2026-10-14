@@ -369,6 +369,14 @@ static int tt_pcie_host_init(struct dw_pcie_rp *pp)
 	writel(TT_PCIE_SUBSYS_MISC_INFO_DBI, tt->sysreg + TT_PCIE_SUBSYS_ARUSER0(tt->id));
 
 	/*
+	 * The Root Port advertises a VPD capability, but the application logic
+	 * that has to serve a VPD request and set its completion flag does not
+	 * exist, so every VPD access times out. Remove the capability before
+	 * the Root Port is enumerated.
+	 */
+	dw_pcie_remove_capability(pci, PCI_CAP_ID_VPD);
+
+	/*
 	 * Only INTx is delivered through the application interrupt. The other
 	 * events it can merge are reported through the Root Port's own
 	 * capabilities, so keep them masked here.
