@@ -5,3 +5,6 @@
 
 config ACPI_RIMT
 	bool
+
+config ACPI_RQSC
+	bool

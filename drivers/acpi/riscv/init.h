@@ -3,3 +3,4 @@
 
 void __init riscv_acpi_init_gsi_mapping(void);
 void __init riscv_acpi_rimt_init(void);
+void __init riscv_acpi_rqsc_init(void);
