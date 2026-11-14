@@ -35,6 +35,7 @@ config ARM64_MPAM_RESCTRL_FS
 menuconfig RISCV_CBQRI
 	bool "RISC-V CBQRI support"
 	depends on RISCV && RISCV_ISA_SSQOSID
+	select ACPI_RQSC if ACPI
 	select ARCH_HAS_CPU_RESCTRL
 	default y
 	help
@@ -47,14 +48,14 @@ if RISCV_CBQRI
 
 config RISCV_CBQRI_CAPACITY
 	bool "RISC-V CBQRI cache capacity-allocation controller"
-	depends on OF
 	help
 	  Enable driver for a RISC-V CBQRI capacity controller that
-	  governs a CPU cache, matching the "riscv,cbqri-capacity-controller"
-	  compatible. The controller's cache phandle gives the cache level and
-	  id, which the driver registers as a resctrl cache-allocation resource.
+	  governs a CPU cache, described in device tree by the
+	  "riscv,cbqri-capacity-controller" compatible or in ACPI by the RQSC
+	  table. The firmware description gives the cache level and id, which
+	  the driver registers as a resctrl cache-allocation resource.
 
-	  Say N unless your device tree describes a CBQRI capacity controller.
+	  Say N unless your firmware describes a CBQRI capacity controller.
 
 endif
 
